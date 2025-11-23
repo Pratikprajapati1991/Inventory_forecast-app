@@ -160,47 +160,105 @@ def require_login():
 def is_admin():
     return st.session_state.get("role") == "admin"
 
+# =========================================
+#  EMAIL + OTP HELPERS
+# =========================================
+
+def send_email(to_email, subject, body):
+    """Send an email using SMTP details from secrets.toml."""
+    if "email" not in st.secrets:
+        st.error("❌ Email settings missing in secrets.toml.")
+        return False
+
+    cfg = st.secrets["email"]
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = cfg["from_address"]
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+            server.starttls()
+            server.login(cfg["username"], cfg["password"])
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to send email: {e}")
+        return False
+
+
+def generate_otp(length=6):
+    """Generate a numeric OTP."""
+    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 # ======================================================
 # LOGIN / LOGOUT UI
 # ======================================================
 def login_screen():
-    st.title("🔐 Inventory Forecast App - Login")
+    st.title("🔐 Inventory Forecast App")
 
-    col1, col2 = st.columns([2, 1])
+    tab_login, tab_forgot = st.tabs(["Login", "Forgot Password"])
 
-    with col1:
+    # ---------------- LOGIN TAB ----------------
+    with tab_login:
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         login_btn = st.button("Login")
 
-    with col2:
-        st.markdown("#### Default Admin")
-        st.code("Username: admin\nPassword: Pratik@123")
+        if login_btn:
+            user = get_user_by_username(username)
+            if not user:
+                st.error("Invalid username or password")
+                return
 
-    if login_btn:
-        user = get_user_by_username(username)
-        if not user:
-            st.error("Invalid username or password")
-            return
+            stored_hash = user["password_hash"]
+            if isinstance(stored_hash, str):
+                stored_hash = stored_hash.encode("utf-8")
 
-        if not user["is_active"]:
-            st.error("Your account is deactivated. Please contact the admin.")
-            return
+            if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
+                st.session_state.logged_in = True
+                st.session_state.username = user["username"]
+                st.session_state.role = user["role"]
+                st.success(f"Welcome, {user['username']}!")
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
 
-        stored_hash = user["password_hash"]
-        if isinstance(stored_hash, str):
-            stored_hash = stored_hash.encode("utf-8")
+    # ---------------- FORGOT PASSWORD TAB ----------------
+    with tab_forgot:
+        st.write("Enter your registered email to receive an OTP.")
 
-        if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
-            st.session_state.logged_in = True
-            st.session_state.username = user["username"]
-            st.session_state.role = user["role"]
-            st.success(f"Welcome, {user['username']} ({user['role'].title()})!")
-            st.rerun()
-        else:
-            st.error("Invalid username or password")
+        email_input = st.text_input("Registered Email")
+        send_otp_btn = st.button("Send OTP")
 
+        if send_otp_btn:
+            # find user
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE email = ?", (email_input,))
+            row = cur.fetchone()
+            conn.close()
+
+            if not row:
+                st.error("No user found with this email.")
+                return
+
+            otp = generate_otp()
+
+            body = f"""
+Your password reset OTP is: {otp}
+
+Valid for 10 minutes.
+If you did not request this, ignore this email.
+"""
+
+            sent = send_email(email_input, "Your Password Reset OTP", body)
+
+            if sent:
+                st.success("OTP sent to your email.")
+                # Store OTP in session for next step
+                st.session_state.reset_email = email_input
+                st.session_state.reset_otp = otp
 
 def logout():
     st.session_state.logged_in = False
@@ -790,6 +848,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
