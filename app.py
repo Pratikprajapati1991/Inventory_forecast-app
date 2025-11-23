@@ -241,6 +241,76 @@ def run_inventory_forecast_app():
     # Quick preview
     with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
         st.dataframe(df.head(10), use_container_width=True)
+    # =====================================================
+    #  🤖 AI ASSISTANT – SMART ITEM INSIGHTS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("🤖 AI Assistant – Item Insights")
+
+    if "Item Name" not in df.columns:
+        st.info("AI Assistant requires 'Item Name' column.")
+        return
+
+    item_list_ai = df["Item Name"].unique().tolist()
+    selected_item_ai = st.selectbox(
+        "Select an item for AI analysis",
+        item_list_ai,
+    )
+
+    item_row = df[df["Item Name"] == selected_item_ai].iloc[0]
+
+    # Convert row to dictionary for easier use
+    item_data = item_row.to_dict()
+
+    # AI prompt construction
+    ai_prompt = f"""
+    You are an expert Supply Chain planner. Analyze the following item data and produce a clear, practical insight summary.
+    
+    Item Name: {item_data.get('Item Name')}
+    Description: {item_data.get('Item Description')}
+    Stock Status: {item_data.get('Stock_Status')}
+    On Hand Qty: {item_data.get('On_Hand_Qty')}
+    Min Stock: {item_data.get('Min_Stock')}
+    Max Stock: {item_data.get('Max_Stock')}
+    Coverage Days: {item_data.get('Coverage_Days')}
+
+    forecast_3M: {item_data.get('forecast_3M')}
+    forecast_6M: {item_data.get('forecast_6M')}
+    forecast_12M: {item_data.get('forecast_12M')}
+
+    Recommended Vendor: {item_data.get('Rec_Vendor_Name')}
+    Vendor Price (USD): {item_data.get('Rec_Vendor_Price_USD')}
+    Vendor Lead Time (Days): {item_data.get('Rec_Vendor_LeadTime_Days')}
+    Vendor On-Time %: {item_data.get('Rec_Vendor_OnTime_Percent')}
+    Vendor Reliability Score: {item_data.get('Rec_Vendor_Reliability_Score')}
+    Vendor Composite Score: {item_data.get('Rec_Vendor_Composite_Score')}
+
+    Provide a structured analysis with:
+    1. Summary of current stock health
+    2. Whether stockout or excess is likely
+    3. Forecast trend interpretation (3M vs 6M vs 12M)
+    4. Vendor recommendation & reliability assessment
+    5. Risk factors to monitor
+    6. Final actionable recommendation (Buy / Hold / Expedite / Monitor)
+    """
+
+    if st.button("Generate AI Insight"):
+        with st.spinner("Thinking…"):
+            from openai import OpenAI
+            client = OpenAI()
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a supply chain expert."},
+                    {"role": "user", "content": ai_prompt},
+                ],
+                max_tokens=400,
+            )
+
+            ai_result = response.choices[0].message["content"]
+            st.markdown("### 🧠 AI Insight Result")
+            st.write(ai_result)
 
     # =====================================================
     #  EXACT STOCKOUT / OVERSTOCK LOGIC USING YOUR COLUMNS
@@ -716,6 +786,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
