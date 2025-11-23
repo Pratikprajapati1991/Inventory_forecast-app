@@ -90,30 +90,75 @@ def logout():
 # -------------------------------------------------------
 # MAIN APP CONTENT (AFTER LOGIN)
 # -------------------------------------------------------
-def run_inventory_forecast_app():
-    """
-    👉 IMPORTANT:
-    This is where your existing inventory forecasting Streamlit code goes.
+import pandas as pd
 
-    For now I'm putting a simple placeholder.
-    In the next step, we will paste your old logic here.
+@st.cache_data
+def load_planning_file():
     """
+    Loads your master planning file.
+    Make sure 'Final_Planning_With_Forecast_And_Vendor.xlsx'
+    is in the same folder as app.py when you deploy.
+    """
+    try:
+        df = pd.read_excel("Final_Planning_With_Forecast_And_Vendor.xlsx")
+        return df
+    except Exception as e:
+        st.error(
+            "❌ Could not load 'Final_Planning_With_Forecast_And_Vendor.xlsx'. "
+            "Check that the file is in the app folder.\n\n"
+            f"Error: {e}"
+        )
+        st.stop()
+
+
+def run_inventory_forecast_app():
     st.header("📊 Inventory Forecast & Planning Dashboard")
 
-    st.info(
-        "Placeholder: this is where your existing forecasting UI will appear.\n\n"
-        "In the next step, you will paste your old app code inside "
-        "`run_inventory_forecast_app()`."
-    )
+    df = load_planning_file()
 
-    # Example dummy content so page is not empty
+    st.subheader("Dataset Preview")
+    st.dataframe(df.head())
+
+    # ---- Metrics (you can adjust column names as per your file) ----
+    # Try to count unique SKUs by 'Item Name' or else by total rows
+    if "Item Name" in df.columns:
+        total_skus = df["Item Name"].nunique()
+    elif "ITEM_NUMBER" in df.columns:
+        total_skus = df["ITEM_NUMBER"].nunique()
+    else:
+        total_skus = df.shape[0]
+
+    # Stockout & Overstock are placeholders based on typical columns.
+    # Adjust these conditions to match your real column names.
+    stockout_items = 0
+    overstock_items = 0
+
+    # Example logic – change column names/conditions to match your sheet:
+    #   - columns like 'Current_Stock', 'Min_Level', 'Max_Level'
+    try:
+        cols = df.columns.str.lower()
+
+        if "current_stock" in cols and "min_level" in cols:
+            current_col = df.columns[cols == "current_stock"][0]
+            min_col = df.columns[cols == "min_level"][0]
+            stockout_items = (df[current_col] < df[min_col]).sum()
+
+        if "current_stock" in cols and "max_level" in cols:
+            current_col = df.columns[cols == "current_stock"][0]
+            max_col = df.columns[cols == "max_level"][0]
+            overstock_items = (df[current_col] > df[max_col]).sum()
+    except Exception:
+        # If column names don't match, just leave them as 0
+        pass
+
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total SKUs", "1,250")
-    with col2:
-        st.metric("Stockout Risk Items", "37")
-    with col3:
-        st.metric("Overstock Items", "112")
+    col1.metric("Total SKUs", f"{total_skus:,}")
+    col2.metric("Stockout Risk Items", f"{stockout_items:,}")
+    col3.metric("Overstock Items", f"{overstock_items:,}")
+
+    st.markdown("---")
+    st.subheader("Full Data")
+    st.dataframe(df, use_container_width=True)
 
 
 def admin_panel():
@@ -172,3 +217,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
