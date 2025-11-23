@@ -259,6 +259,41 @@ If you did not request this, ignore this email.
                 # Store OTP in session for next step
                 st.session_state.reset_email = email_input
                 st.session_state.reset_otp = otp
+        # ---------- Step 2: Verify OTP & Set New Password ----------
+        if st.session_state.get("reset_email") and st.session_state.get("reset_otp"):
+            st.markdown("---")
+            st.markdown("### Set New Password")
+
+            otp_input = st.text_input("Enter OTP received in email", key="reset_otp_input")
+            new_pass = st.text_input("New Password", type="password", key="reset_new_pass")
+            confirm_pass = st.text_input("Confirm New Password", type="password", key="reset_confirm_pass")
+            reset_btn = st.button("Reset Password")
+
+            if reset_btn:
+                if not otp_input or not new_pass or not confirm_pass:
+                    st.error("Please fill all fields.")
+                elif new_pass != confirm_pass:
+                    st.error("New password and confirm password do not match.")
+                elif otp_input != st.session_state.get("reset_otp"):
+                    st.error("Invalid OTP.")
+                else:
+                    # Update password in database for this email
+                    email = st.session_state.get("reset_email")
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    new_hash = bcrypt.hashpw(new_pass.encode("utf-8"), bcrypt.gensalt())
+                    cur.execute(
+                        "UPDATE users SET password_hash = ? WHERE email = ?",
+                        (new_hash, email),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    # Clear reset data from session
+                    st.session_state.reset_email = None
+                    st.session_state.reset_otp = None
+
+                    st.success("Password reset successfully. You can now log in with your new password.")
 
 def logout():
     st.session_state.logged_in = False
@@ -848,6 +883,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
