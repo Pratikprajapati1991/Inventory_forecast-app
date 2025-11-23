@@ -1,37 +1,143 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
+import bcrypt
+from datetime import datetime
 
-# -------------------------------------------------------
+# ======================================================
 # BASIC CONFIG
-# -------------------------------------------------------
+# ======================================================
 st.set_page_config(
     page_title="Inventory Forecast App",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# -------------------------------------------------------
-# SIMPLE USER DATABASE (IN-MEMORY)
-# -------------------------------------------------------
-USERS = {
-    "admin": {
-        "password": "Pratik@123",
-        "role": "admin",
-        "full_name": "Admin User",
-    },
-    "user1": {
-        "password": "User@123",
-        "role": "viewer",
-        "full_name": "Viewer User",
-    },
-    # You can add more users like this:
-    # "another": {"password": "Pass@123", "role": "viewer", "full_name": "Some User"},
-}
+DB_PATH = "users.db"   # SQLite file for users
 
 
-# -------------------------------------------------------
+# ======================================================
+# DATABASE HELPERS
+# ======================================================
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_user_db():
+    """Create users table if it doesn't exist and ensure an admin user."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE,
+            password_hash BLOB NOT NULL,
+            role TEXT NOT NULL DEFAULT 'viewer',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+    # Ensure default admin exists
+    cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
+    admin = cur.fetchone()
+    if not admin:
+        default_password = "Pratik@123"
+        password_hash = bcrypt.hashpw(default_password.encode("utf-8"), bcrypt.gensalt())
+        cur.execute(
+            """
+            INSERT INTO users (username, email, password_hash, role, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "admin",
+                "admin@example.com",
+                password_hash,
+                "admin",
+                1,
+                datetime.utcnow().isoformat()
+            ),
+        )
+        conn.commit()
+    conn.close()
+
+
+def create_user(username, email, password, role="viewer"):
+    conn = get_connection()
+    cur = conn.cursor()
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    try:
+        cur.execute(
+            """
+            INSERT INTO users (username, email, password_hash, role, is_active, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (username, email, password_hash, role, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return True, "User created successfully."
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed: users.username" in str(e):
+            return False, "Username already exists."
+        if "UNIQUE constraint failed: users.email" in str(e):
+            return False, "Email already exists."
+        return False, f"Database error: {e}"
+    finally:
+        conn.close()
+
+
+def get_user_by_username(username):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def list_users():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def set_user_active(username, is_active: bool):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET is_active = ? WHERE username = ?",
+        (1 if is_active else 0, username),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_user(username):
+    if username == "admin":
+        return False, "Cannot delete default admin user."
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE username = ?", (username,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    if deleted:
+        return True, "User deleted."
+    return False, "User not found."
+
+
+# ======================================================
 # SESSION HELPERS
-# -------------------------------------------------------
+# ======================================================
 def init_session_state():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
@@ -51,9 +157,9 @@ def is_admin():
     return st.session_state.get("role") == "admin"
 
 
-# -------------------------------------------------------
-# LOGIN / LOGOUT
-# -------------------------------------------------------
+# ======================================================
+# LOGIN / LOGOUT UI
+# ======================================================
 def login_screen():
     st.title("🔐 Inventory Forecast App - Login")
 
@@ -65,23 +171,29 @@ def login_screen():
         login_btn = st.button("Login")
 
     with col2:
-        st.markdown("#### Demo Credentials")
-        st.code(
-            "Admin : admin / Pratik@123\n"
-            "Viewer: user1 / User@123"
-        )
+        st.markdown("#### Default Admin")
+        st.code("Username: admin\nPassword: Pratik@123")
 
     if login_btn:
-        user = USERS.get(username)
-        if user and password == user["password"]:
+        user = get_user_by_username(username)
+        if not user:
+            st.error("Invalid username or password")
+            return
+
+        if not user["is_active"]:
+            st.error("Your account is deactivated. Please contact the admin.")
+            return
+
+        stored_hash = user["password_hash"]
+        if isinstance(stored_hash, str):
+            stored_hash = stored_hash.encode("utf-8")
+
+        if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
             st.session_state.logged_in = True
-            st.session_state.username = username
+            st.session_state.username = user["username"]
             st.session_state.role = user["role"]
-            st.success(
-                f"Welcome, {user['full_name']} "
-                f"({user['role'].title()})!"
-            )
-            st.rerun()  # ✅ correct rerun
+            st.success(f"Welcome, {user['username']} ({user['role'].title()})!")
+            st.rerun()
         else:
             st.error("Invalid username or password")
 
@@ -94,9 +206,9 @@ def logout():
     st.rerun()
 
 
-# -------------------------------------------------------
-# MAIN DASHBOARD (UPLOAD-BASED)
-# -------------------------------------------------------
+# ======================================================
+# DASHBOARD – INVENTORY & FORECAST (FILE UPLOAD)
+# ======================================================
 def run_inventory_forecast_app():
     require_login()
 
@@ -163,8 +275,7 @@ def run_inventory_forecast_app():
             overstock_items = (df[current_col] > df[max_col]).sum()
             overstock_items_display = f"{overstock_items:,}"
     except Exception:
-        # If any error in logic, just leave as N/A
-        pass
+        pass  # leave as N/A if anything fails
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Total SKUs", f"{total_skus:,}")
@@ -176,45 +287,111 @@ def run_inventory_forecast_app():
     st.dataframe(df, use_container_width=True)
 
 
-# -------------------------------------------------------
-# ADMIN PANEL
-# -------------------------------------------------------
+# ======================================================
+# ADMIN PANEL – MANAGE USERS
+# ======================================================
 def admin_panel():
     require_login()
     if not is_admin():
         st.error("You are not authorized to view this page.")
         st.stop()
 
-    st.subheader("🛠 Admin Panel")
+    st.subheader("🛠 Admin Panel – User Management")
+
     st.write(
         f"Logged in as: **{st.session_state.username}** "
         f"(Role: **{st.session_state.role}**)"
     )
 
-    st.markdown("### Users (In-Memory Demo)")
-    for uname, info in USERS.items():
-        st.write(
-            f"- **{uname}** – Role: `{info['role']}`, "
-            f"Name: {info['full_name']}"
-        )
+    # ----- Add New User -----
+    st.markdown("### ➕ Add New User")
+    with st.form("add_user_form"):
+        new_username = st.text_input("Username")
+        new_email = st.text_input("Email")
+        new_password = st.text_input("Password", type="password")
+        new_role = st.selectbox("Role", ["viewer", "admin"])
+        submitted = st.form_submit_button("Create User")
+
+    if submitted:
+        if not new_username or not new_password:
+            st.error("Username and Password are required.")
+        else:
+            ok, msg = create_user(new_username, new_email, new_password, new_role)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    st.markdown("---")
+
+    # ----- Existing Users -----
+    st.markdown("### 👥 Existing Users")
+    users = list_users()
+    if not users:
+        st.info("No users found.")
+    else:
+        for u in users:
+            cols = st.columns([2, 2, 2, 1, 2])
+            with cols[0]:
+                st.write(f"**{u['username']}**")
+            with cols[1]:
+                st.write(u["email"] or "—")
+            with cols[2]:
+                st.write(f"Role: `{u['role']}`")
+            with cols[3]:
+                active_label = "Active" if u["is_active"] else "Inactive"
+                st.write(active_label)
+            with cols[4]:
+                st.write(f"Created: {u['created_at'][:19]}")
+
+    st.markdown("---")
+
+    # ----- Activate / Deactivate User -----
+    st.markdown("### ✅ Activate / Deactivate User")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        tgt_user = st.text_input("Username to activate/deactivate")
+    with col_b:
+        active_choice = st.selectbox("Set status to", ["Active", "Inactive"])
+    if st.button("Update Status"):
+        if not tgt_user:
+            st.error("Please enter a username.")
+        else:
+            set_user_active(tgt_user, active_choice == "Active")
+            st.success(f"Status for '{tgt_user}' set to {active_choice}.")
+            st.rerun()
+
+    # ----- Delete User -----
+    st.markdown("### 🗑 Delete User")
+    del_user = st.text_input("Username to delete (cannot delete 'admin')")
+    if st.button("Delete User"):
+        if not del_user:
+            st.error("Please enter a username.")
+        else:
+            ok, msg = delete_user(del_user)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
 
     st.info(
-        "Future upgrades (later steps):\n"
-        "- Move users to a real database (SQLite)\n"
-        "- Add password reset\n"
-        "- Add OTP login via email\n"
-        "- Add detailed role-based permissions"
+        "Next steps (future upgrades):\n"
+        "- Password reset via email / OTP\n"
+        "- Detailed audit logs and login history\n"
+        "- Per-page permissions"
     )
 
 
-# -------------------------------------------------------
+# ======================================================
 # MAIN ROUTER
-# -------------------------------------------------------
+# ======================================================
 def main():
+    init_user_db()
     init_session_state()
 
     if not st.session_state.logged_in:
-        # Only show login when not logged in
         login_screen()
         return
 
