@@ -339,22 +339,171 @@ def run_inventory_forecast_app():
     with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
         st.dataframe(df.head(10), use_container_width=True)
     # =====================================================
-    #  🤖 AI ASSISTANT – SMART ITEM INSIGHTS
+    #  🤖 LOCAL ASSISTANT – FAST ITEM INSIGHTS (NO API CALL)
     # =====================================================
     st.markdown("---")
-    st.subheader("🤖 AI Assistant – Item Insights")
+    st.subheader("🤖 Item Insights (Local – Instant)")
 
     if "Item Name" not in df.columns:
-        st.info("AI Assistant requires 'Item Name' column.")
+        st.info("Item insights require an 'Item Name' column.")
         return
 
     item_list_ai = df["Item Name"].unique().tolist()
     selected_item_ai = st.selectbox(
-        "Select an item for AI analysis",
+        "Select an item for analysis",
         item_list_ai,
+        key="ai_item_select",
     )
 
     item_row = df[df["Item Name"] == selected_item_ai].iloc[0]
+    item_data = item_row.to_dict()
+
+    # Extract fields safely
+    name = item_data.get("Item Name", "N/A")
+    desc = item_data.get("Item Description", "N/A")
+    status = str(item_data.get("Stock_Status", "N/A"))
+    on_hand = item_data.get("On_Hand_Qty", None)
+    min_stock = item_data.get("Min_Stock", None)
+    max_stock = item_data.get("Max_Stock", None)
+    cov_days = item_data.get("Coverage_Days", None)
+
+    f3 = item_data.get("forecast_3M", None)
+    f6 = item_data.get("forecast_6M", None)
+    f12 = item_data.get("forecast_12M", None)
+
+    vendor = item_data.get("Rec_Vendor_Name", "N/A")
+    v_price = item_data.get("Rec_Vendor_Price_USD", None)
+    v_lead = item_data.get("Rec_Vendor_LeadTime_Days", None)
+    v_ontime = item_data.get("Rec_Vendor_OnTime_Percent", None)
+    v_rel = item_data.get("Rec_Vendor_Reliability_Score", None)
+    v_comp = item_data.get("Rec_Vendor_Composite_Score", None)
+
+    # ---- Build rule-based insights (instant, no network) ----
+    # 1. Stock health text
+    stock_summary = []
+    if on_hand is not None and min_stock is not None and max_stock is not None:
+        try:
+            if on_hand < min_stock:
+                stock_summary.append("🔴 Current stock is **below Min_Stock** → shortage risk.")
+            elif on_hand > max_stock:
+                stock_summary.append("🟠 Current stock is **above Max_Stock** → excess/overstock risk.")
+            else:
+                stock_summary.append("🟢 Current stock is **between Min and Max** → healthy range.")
+        except Exception:
+            pass
+
+    if status.lower().startswith("shortage"):
+        stock_summary.append("⚠ Stock_Status is **Shortage_Risk** – item needs attention.")
+    elif status.lower().startswith("excess"):
+        stock_summary.append("⚠ Stock_Status is **Excess_Risk** – consider slowing or stopping orders.")
+    elif status.lower() == "ok":
+        stock_summary.append("✅ Stock_Status is **OK** – item is under control.")
+    elif "no-rop" in status.lower():
+        stock_summary.append("ℹ Stock_Status is **No-ROP-Model** – reorder policy not defined, review settings.")
+
+    # 2. Coverage interpretation
+    coverage_text = []
+    try:
+        if cov_days is not None:
+            if cov_days < 15:
+                coverage_text.append(f"🔴 Coverage is only **{cov_days:.1f} days** – very low, high risk of stockout.")
+            elif cov_days < 45:
+                coverage_text.append(f"🟠 Coverage is **{cov_days:.1f} days** – moderate, monitor closely.")
+            elif cov_days < 120:
+                coverage_text.append(f"🟢 Coverage is **{cov_days:.1f} days** – comfortable.")
+            else:
+                coverage_text.append(f"🟣 Coverage is **{cov_days:.1f} days** – very high, potential overstock.")
+    except Exception:
+        pass
+
+    # 3. Forecast trend (3M vs 6M vs 12M)
+    forecast_text = []
+    try:
+        if f3 is not None and f6 is not None and f12 is not None:
+            if f12 > f6 > f3:
+                forecast_text.append("📈 Demand forecast is **accelerating** (3M < 6M < 12M). Future demand increasing.")
+            elif f12 < f6 < f3:
+                forecast_text.append("📉 Demand forecast is **declining** (3M > 6M > 12M). Demand is slowing down.")
+            else:
+                forecast_text.append("➖ Demand forecast is **mixed/flat** – no clear up or down trend.")
+    except Exception:
+        pass
+
+    # 4. Vendor assessment
+    vendor_text = []
+    vendor_text.append(f"Primary recommended vendor: **{vendor}**.")
+    try:
+        if v_ontime is not None:
+            if v_ontime >= 95:
+                vendor_text.append(f"✅ On-time performance is **{v_ontime:.1f}%** – very reliable.")
+            elif v_ontime >= 85:
+                vendor_text.append(f"🟢 On-time performance is **{v_ontime:.1f}%** – generally reliable.")
+            elif v_ontime >= 70:
+                vendor_text.append(f"🟠 On-time performance is **{v_ontime:.1f}%** – moderate, monitor closely.")
+            else:
+                vendor_text.append(f"🔴 On-time performance is **{v_ontime:.1f}%** – weak, high delay risk.")
+    except Exception:
+        pass
+
+    try:
+        if v_rel is not None:
+            vendor_text.append(f"Vendor reliability score: **{v_rel}**.")
+        if v_comp is not None:
+            vendor_text.append(f"Vendor composite score: **{v_comp}**.")
+        if v_price is not None:
+            vendor_text.append(f"Unit price (USD): **{v_price}**.")
+        if v_lead is not None:
+            vendor_text.append(f"Lead time: **{v_lead} days**.")
+    except Exception:
+        pass
+
+    # 5. Simple action recommendation
+    recommendation_lines = []
+    try:
+        if status.lower().startswith("shortage") or (on_hand is not None and min_stock is not None and on_hand < min_stock):
+            recommendation_lines.append("✅ **Action:** Consider placing/releasing a PO immediately for this item.")
+        elif status.lower().startswith("excess") or (on_hand is not None and max_stock is not None and on_hand > max_stock):
+            recommendation_lines.append("✅ **Action:** Slow down or pause new orders, and review consumption plan.")
+        elif status.lower() == "ok":
+            recommendation_lines.append("✅ **Action:** No urgent action; continue monitoring based on coverage and forecast.")
+        else:
+            recommendation_lines.append("ℹ **Action:** Review item parameters (Min/Max, forecast, vendor) before deciding.")
+    except Exception:
+        pass
+
+    # ---- Display nicely ----
+    st.markdown(f"### 🧾 Summary for: **{name}**")
+    st.markdown(f"**Description:** {desc}")
+
+    st.markdown("#### 1. Stock Health")
+    if stock_summary:
+        for line in stock_summary:
+            st.write(line)
+    else:
+        st.write("No stock health information available.")
+
+    st.markdown("#### 2. Coverage Analysis")
+    if coverage_text:
+        for line in coverage_text:
+            st.write(line)
+    else:
+        st.write("Coverage information not available.")
+
+    st.markdown("#### 3. Forecast Behaviour")
+    if forecast_text:
+        for line in forecast_text:
+            st.write(line)
+    else:
+        st.write("Forecast information not sufficient to derive a trend.")
+
+    st.markdown("#### 4. Vendor Assessment")
+    for line in vendor_text:
+        st.write(line)
+
+    st.markdown("#### 5. Recommended Next Action")
+    for line in recommendation_lines:
+        st.write(line)
+
 
     # Convert row to dictionary for easier use
     item_data = item_row.to_dict()
@@ -883,6 +1032,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
