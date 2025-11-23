@@ -250,6 +250,10 @@ def run_inventory_forecast_app():
 
     # Use your existing Stock_Status values:
     #   Shortage_Risk, Excess_Risk, OK, No-ROP-Model
+    if "Stock_Status" not in df.columns:
+        st.error("Column 'Stock_Status' not found in file.")
+        st.stop()
+
     status_counts = df["Stock_Status"].value_counts()
 
     shortage = int(status_counts.get("Shortage_Risk", 0))
@@ -293,15 +297,163 @@ def run_inventory_forecast_app():
 
             # Simple coverage distribution chart
             st.write("Coverage days distribution (bucketed):")
-            cov_bins = pd.cut(cov, bins=[0, 30, 60, 90, 180, 365, cov.max()],
-                              labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"])
-            cov_counts = cov_bins.value_counts().sort_index().rename_axis("Coverage_Bucket").reset_index(name="Count")
-            cov_counts = cov_counts.set_index("Coverage_Bucket")
+            cov_bins = pd.cut(
+                cov,
+                bins=[0, 30, 60, 90, 180, 365, cov.max()],
+                labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"]
+            )
+            cov_counts = (
+                cov_bins.value_counts()
+                .sort_index()
+                .rename_axis("Coverage_Bucket")
+                .reset_index(name="Count")
+                .set_index("Coverage_Bucket")
+            )
             st.bar_chart(cov_counts)
         else:
             st.info("Coverage_Days column is present but contains no numeric data.")
     else:
         st.info("No 'Coverage_Days' column found – skipping coverage analysis.")
+
+    # =====================================================
+    #  DETAILED TABLES BY STATUS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📃 Item-Level Details by Risk Category")
+
+    tab_all, tab_short, tab_excess, tab_ok, tab_nomodel = st.tabs(
+        ["All Items", "Shortage Risk", "Excess Risk", "OK", "No-ROP-Model"]
+    )
+
+    with tab_all:
+        st.dataframe(df, use_container_width=True)
+
+    with tab_short:
+        st.write(f"Total Shortage_Risk items: **{shortage:,}**")
+        st.dataframe(df[df["Stock_Status"] == "Shortage_Risk"], use_container_width=True)
+
+    with tab_excess:
+        st.write(f"Total Excess_Risk items: **{excess:,}**")
+        st.dataframe(df[df["Stock_Status"] == "Excess_Risk"], use_container_width=True)
+
+    with tab_ok:
+        st.write(f"Total OK items: **{healthy:,}**")
+        st.dataframe(df[df["Stock_Status"] == "OK"], use_container_width=True)
+
+    with tab_nomodel:
+        st.write(f"Total No-ROP-Model items: **{no_model:,}**")
+        st.dataframe(df[df["Stock_Status"] == "No-ROP-Model"], use_container_width=True)
+
+    # =====================================================
+    #  📈 FORECAST OVERVIEW USING forecast_3M / 6M / 12M
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📈 Forecast Overview")
+
+    forecast_cols = ["forecast_3M", "forecast_6M", "forecast_12M"]
+    missing_forecast = [c for c in forecast_cols if c not in df.columns]
+
+    if missing_forecast:
+        st.info(
+            f"Forecast columns missing: {', '.join(missing_forecast)}. "
+            "Skipping forecast charts."
+        )
+        return
+
+    # Ensure numeric
+    fdf = df.copy()
+    for c in forecast_cols:
+        fdf[c] = pd.to_numeric(fdf[c], errors="coerce")
+
+    totals = fdf[forecast_cols].sum()
+
+    colF1, colF2, colF3, colF4 = st.columns(4)
+    colF1.metric("Total Forecast 3M", f"{totals['forecast_3M']:.0f}")
+    colF2.metric("Total Forecast 6M", f"{totals['forecast_6M']:.0f}")
+    colF3.metric("Total Forecast 12M", f"{totals['forecast_12M']:.0f}")
+    colF4.metric("Avg Monthly Forecast (12M)", f"{(totals['forecast_12M'] / 12):.0f}")
+
+    # Simple aggregate chart: horizon vs total forecast
+    agg_forecast_df = (
+        totals.rename_axis("Horizon")
+        .reset_index(name="Quantity")
+        .set_index("Horizon")
+    )
+    st.bar_chart(agg_forecast_df)
+
+    # =====================================================
+    #  🔍 ITEM-WISE FORECAST EXPLORER
+    # =====================================================
+    st.markdown("### 🔍 Item-wise Forecast Explorer")
+
+    if "Item Name" in fdf.columns:
+        # Limit to items with some forecast
+        fdf_nonzero = fdf[
+            (fdf["forecast_3M"] > 0)
+            | (fdf["forecast_6M"] > 0)
+            | (fdf["forecast_12M"] > 0)
+        ]
+        if fdf_nonzero.empty:
+            st.info("No items with non-zero forecast values.")
+            return
+
+        # Sort by highest 12M forecast
+        fdf_nonzero = fdf_nonzero.sort_values("forecast_12M", ascending=False)
+
+        item_list = fdf_nonzero["Item Name"].unique().tolist()
+        selected_item = st.selectbox(
+            "Select an item (sorted by highest 12M forecast)",
+            item_list,
+        )
+
+        row = fdf_nonzero[fdf_nonzero["Item Name"] == selected_item].iloc[0]
+
+        # Prepare chart data: On-hand vs forecast horizons
+        values = {}
+        if "On_Hand_Qty" in row.index:
+            values["On Hand"] = row["On_Hand_Qty"]
+        values["Forecast 3M"] = row["forecast_3M"]
+        values["Forecast 6M"] = row["forecast_6M"]
+        values["Forecast 12M"] = row["forecast_12M"]
+
+        item_chart_df = (
+            pd.Series(values)
+            .rename_axis("Horizon")
+            .reset_index(name="Quantity")
+            .set_index("Horizon")
+        )
+
+        st.write(f"**Item:** {selected_item}")
+        st.bar_chart(item_chart_df)
+
+        # Show key fields for this item
+        info_cols = [
+            "Item Name",
+            "Item Description",
+            "On_Hand_Qty",
+            "Min_Stock",
+            "Max_Stock",
+            "Coverage_Days",
+            "Stock_Status",
+            "forecast_3M",
+            "forecast_6M",
+            "forecast_12M",
+            "Rec_Vendor_Name",
+            "Rec_Vendor_Price_USD",
+            "Rec_Vendor_LeadTime_Days",
+            "Rec_Vendor_OnTime_Percent",
+            "Rec_Vendor_Reliability_Score",
+            "Rec_Vendor_Composite_Score",
+        ]
+        info_cols = [c for c in info_cols if c in row.index]
+
+        st.write("**Item details:**")
+        st.dataframe(
+            pd.DataFrame(row[info_cols]).T,
+            use_container_width=True,
+        )
+    else:
+        st.info("Column 'Item Name' not found, cannot build item-wise explorer.")
 
     # =====================================================
     #  DETAILED TABLES BY STATUS
@@ -564,5 +716,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
