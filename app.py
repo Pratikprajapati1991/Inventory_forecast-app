@@ -1,15 +1,17 @@
 import streamlit as st
+import pandas as pd
 
 # -------------------------------------------------------
 # BASIC CONFIG
 # -------------------------------------------------------
-st.set_page_config(page_title="Inventory Forecast App",
-                   layout="wide",
-                   initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Inventory Forecast App",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # -------------------------------------------------------
-# SIMPLE IN-MEMORY USER DATABASE
-# (Later we can move this to SQLite + email OTP etc.)
+# SIMPLE USER DATABASE (IN-MEMORY)
 # -------------------------------------------------------
 USERS = {
     "admin": {
@@ -20,10 +22,10 @@ USERS = {
     "user1": {
         "password": "User@123",
         "role": "viewer",
-        "full_name": "Viewer User 1",
+        "full_name": "Viewer User",
     },
-    # You can add more users here
-    # "another_user": {"password": "Password123", "role": "viewer", "full_name": "XYZ"},
+    # You can add more users like this:
+    # "another": {"password": "Pass@123", "role": "viewer", "full_name": "Some User"},
 }
 
 
@@ -40,7 +42,6 @@ def init_session_state():
 
 
 def require_login():
-    """Stop the app if user is not logged in."""
     if not st.session_state.get("logged_in", False):
         st.warning("Please log in to continue.")
         st.stop()
@@ -51,12 +52,13 @@ def is_admin():
 
 
 # -------------------------------------------------------
-# LOGIN / LOGOUT UI
+# LOGIN / LOGOUT
 # -------------------------------------------------------
 def login_screen():
     st.title("🔐 Inventory Forecast App - Login")
 
     col1, col2 = st.columns([2, 1])
+
     with col1:
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -64,7 +66,10 @@ def login_screen():
 
     with col2:
         st.markdown("#### Demo Credentials")
-        st.code("Admin:   admin / Pratik@123\nViewer:  user1 / User@123")
+        st.code(
+            "Admin : admin / Pratik@123\n"
+            "Viewer: user1 / User@123"
+        )
 
     if login_btn:
         user = USERS.get(username)
@@ -72,9 +77,11 @@ def login_screen():
             st.session_state.logged_in = True
             st.session_state.username = username
             st.session_state.role = user["role"]
-            st.success(f"Welcome, {user['full_name']} ({user['role'].title()})!")
-            # ✅ Correct function instead of st.experimental_rerun()
-            st.rerun()
+            st.success(
+                f"Welcome, {user['full_name']} "
+                f"({user['role'].title()})!"
+            )
+            st.rerun()  # ✅ correct rerun
         else:
             st.error("Invalid username or password")
 
@@ -88,111 +95,130 @@ def logout():
 
 
 # -------------------------------------------------------
-# MAIN APP CONTENT (AFTER LOGIN)
+# MAIN DASHBOARD (UPLOAD-BASED)
 # -------------------------------------------------------
-import pandas as pd
-
-@st.cache_data
-def load_planning_file():
-    """
-    Loads your master planning file.
-    Make sure 'Final_Planning_With_Forecast_And_Vendor.xlsx'
-    is in the same folder as app.py when you deploy.
-    """
-    try:
-        df = pd.read_excel("Final_Planning_With_Forecast_And_Vendor.xlsx")
-        return df
-    except Exception as e:
-        st.error(
-            "❌ Could not load 'Final_Planning_With_Forecast_And_Vendor.xlsx'. "
-            "Check that the file is in the app folder.\n\n"
-            f"Error: {e}"
-        )
-        st.stop()
-
-
 def run_inventory_forecast_app():
+    require_login()
+
     st.header("📊 Inventory Forecast & Planning Dashboard")
 
-    df = load_planning_file()
+    st.info(
+        "Step 1: Upload your latest planning Excel file "
+        "(for example: Final_Planning_With_Forecast_And_Vendor.xlsx)."
+    )
 
+    uploaded_file = st.file_uploader(
+        "Upload planning file (Excel)",
+        type=["xlsx"],
+        help="Upload the same master file you use for planning."
+    )
+
+    if uploaded_file is None:
+        st.stop()
+
+    # Read Excel into DataFrame
+    try:
+        df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading Excel file: {e}")
+        st.stop()
+
+    st.success(f"File loaded: {uploaded_file.name}")
+    st.write(f"Rows: **{df.shape[0]}**, Columns: **{df.shape[1]}**")
+
+    st.subheader("Columns in your file")
+    st.write(list(df.columns))
+
+    st.markdown("---")
     st.subheader("Dataset Preview")
-    st.dataframe(df.head())
+    st.dataframe(df.head(), use_container_width=True)
 
-    # ---- Metrics (you can adjust column names as per your file) ----
-    # Try to count unique SKUs by 'Item Name' or else by total rows
+    # --------- Metrics ---------
+    # Total SKUs
+    total_skus = df.shape[0]
     if "Item Name" in df.columns:
         total_skus = df["Item Name"].nunique()
     elif "ITEM_NUMBER" in df.columns:
         total_skus = df["ITEM_NUMBER"].nunique()
-    else:
-        total_skus = df.shape[0]
+    elif "Item Code" in df.columns:
+        total_skus = df["Item Code"].nunique()
 
-    # Stockout & Overstock are placeholders based on typical columns.
-    # Adjust these conditions to match your real column names.
-    stockout_items = 0
-    overstock_items = 0
+    # For now we keep simple placeholder logic
+    stockout_items_display = "N/A"
+    overstock_items_display = "N/A"
 
-    # Example logic – change column names/conditions to match your sheet:
-    #   - columns like 'Current_Stock', 'Min_Level', 'Max_Level'
+    cols_lower = [c.lower() for c in df.columns]
+
     try:
-        cols = df.columns.str.lower()
-
-        if "current_stock" in cols and "min_level" in cols:
-            current_col = df.columns[cols == "current_stock"][0]
-            min_col = df.columns[cols == "min_level"][0]
+        # Look for typical column names
+        if "current_stock" in cols_lower and "min_level" in cols_lower:
+            current_col = df.columns[cols_lower.index("current_stock")]
+            min_col = df.columns[cols_lower.index("min_level")]
             stockout_items = (df[current_col] < df[min_col]).sum()
+            stockout_items_display = f"{stockout_items:,}"
 
-        if "current_stock" in cols and "max_level" in cols:
-            current_col = df.columns[cols == "current_stock"][0]
-            max_col = df.columns[cols == "max_level"][0]
+        if "current_stock" in cols_lower and "max_level" in cols_lower:
+            current_col = df.columns[cols_lower.index("current_stock")]
+            max_col = df.columns[cols_lower.index("max_level")]
             overstock_items = (df[current_col] > df[max_col]).sum()
+            overstock_items_display = f"{overstock_items:,}"
     except Exception:
-        # If column names don't match, just leave them as 0
+        # If any error in logic, just leave as N/A
         pass
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Total SKUs", f"{total_skus:,}")
-    col2.metric("Stockout Risk Items", f"{stockout_items:,}")
-    col3.metric("Overstock Items", f"{overstock_items:,}")
+    col2.metric("Stockout Risk Items", stockout_items_display)
+    col3.metric("Overstock Items", overstock_items_display)
 
     st.markdown("---")
     st.subheader("Full Data")
     st.dataframe(df, use_container_width=True)
 
 
+# -------------------------------------------------------
+# ADMIN PANEL
+# -------------------------------------------------------
 def admin_panel():
+    require_login()
+    if not is_admin():
+        st.error("You are not authorized to view this page.")
+        st.stop()
+
     st.subheader("🛠 Admin Panel")
+    st.write(
+        f"Logged in as: **{st.session_state.username}** "
+        f"(Role: **{st.session_state.role}**)"
+    )
 
-    st.write(f"Logged in as: **{st.session_state.username}** (Role: **{st.session_state.role}**)")
-
-    st.markdown("### User List (In-Memory Demo)")
+    st.markdown("### Users (In-Memory Demo)")
     for uname, info in USERS.items():
         st.write(
-            f"- **{uname}** – Role: `{info['role']}`, Name: {info['full_name']}"
+            f"- **{uname}** – Role: `{info['role']}`, "
+            f"Name: {info['full_name']}"
         )
 
     st.info(
-        "Later we can:\n"
-        "- Move users to a database (SQLite)\n"
-        "- Add user creation, deactivation\n"
-        "- Implement password reset and OTP login via email\n"
+        "Future upgrades (later steps):\n"
+        "- Move users to a real database (SQLite)\n"
+        "- Add password reset\n"
+        "- Add OTP login via email\n"
         "- Add detailed role-based permissions"
     )
 
 
 # -------------------------------------------------------
-# ROUTER
+# MAIN ROUTER
 # -------------------------------------------------------
 def main():
     init_session_state()
 
     if not st.session_state.logged_in:
-        # Not logged in -> show login page only
+        # Only show login when not logged in
         login_screen()
         return
 
-    # Logged in -> show app
+    # Logged in: show sidebar + pages
     st.sidebar.title("Navigation")
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
@@ -207,14 +233,10 @@ def main():
     if choice == "Dashboard":
         run_inventory_forecast_app()
     elif choice == "Admin Panel":
-        if is_admin():
-            admin_panel()
-        else:
-            st.error("You are not authorized to view this page.")
+        admin_panel()
     elif choice == "Logout":
         logout()
 
 
 if __name__ == "__main__":
     main()
-
