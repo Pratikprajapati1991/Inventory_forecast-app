@@ -216,13 +216,13 @@ def run_inventory_forecast_app():
 
     st.info(
         "Step 1: Upload your latest planning Excel file "
-        "(for example: Final_Planning_With_Forecast_And_Vendor.xlsx)."
+        "(Final_Planning_With_Forecast_And_Vendor.xlsx or similar)."
     )
 
     uploaded_file = st.file_uploader(
         "Upload planning file (Excel)",
         type=["xlsx"],
-        help="Upload the same master file you use for planning."
+        help="Upload your final planning master file."
     )
 
     if uploaded_file is None:
@@ -238,12 +238,100 @@ def run_inventory_forecast_app():
     st.success(f"File loaded: {uploaded_file.name}")
     st.write(f"Rows: **{df.shape[0]}**, Columns: **{df.shape[1]}**")
 
-    st.subheader("Columns in your file")
-    st.write(list(df.columns))
+    # Quick preview
+    with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
+        st.dataframe(df.head(10), use_container_width=True)
+
+    # =====================================================
+    #  EXACT STOCKOUT / OVERSTOCK LOGIC USING YOUR COLUMNS
+    # =====================================================
+    # Total SKUs
+    total_skus = df["Item Name"].nunique() if "Item Name" in df.columns else df.shape[0]
+
+    # Use your existing Stock_Status values:
+    #   Shortage_Risk, Excess_Risk, OK, No-ROP-Model
+    status_counts = df["Stock_Status"].value_counts()
+
+    shortage = int(status_counts.get("Shortage_Risk", 0))
+    excess = int(status_counts.get("Excess_Risk", 0))
+    healthy = int(status_counts.get("OK", 0))
+    no_model = int(status_counts.get("No-ROP-Model", 0))
+
+    # Top metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total SKUs", f"{total_skus:,}")
+    c2.metric("Shortage Risk", f"{shortage:,}")
+    c3.metric("Excess Risk", f"{excess:,}")
+    c4.metric("Healthy (OK)", f"{healthy:,}")
+    c5.metric("No ROP Model", f"{no_model:,}")
 
     st.markdown("---")
-    st.subheader("Dataset Preview")
-    st.dataframe(df.head(), use_container_width=True)
+    st.subheader("📦 Inventory Risk Overview")
+
+    # Status bar chart
+    status_chart_df = (
+        status_counts.rename_axis("Status")
+        .reset_index(name="Count")
+        .set_index("Status")
+    )
+    st.bar_chart(status_chart_df)
+
+    # =====================================================
+    #  COVERAGE & STOCK LEVEL INSIGHTS (USING YOUR COLUMNS)
+    # =====================================================
+    st.markdown("---")
+    st.subheader("⏱ Coverage & Stock Level Insights")
+
+    if "Coverage_Days" in df.columns:
+        cov = df["Coverage_Days"].dropna()
+        if not cov.empty:
+            colA, colB, colC, colD = st.columns(4)
+            colA.metric("Avg Coverage (days)", f"{cov.mean():.1f}")
+            colB.metric("Median Coverage (days)", f"{cov.median():.1f}")
+            colC.metric("P10 (Low)", f"{cov.quantile(0.10):.0f}")
+            colD.metric("P90 (High)", f"{cov.quantile(0.90):.0f}")
+
+            # Simple coverage distribution chart
+            st.write("Coverage days distribution (bucketed):")
+            cov_bins = pd.cut(cov, bins=[0, 30, 60, 90, 180, 365, cov.max()],
+                              labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"])
+            cov_counts = cov_bins.value_counts().sort_index().rename_axis("Coverage_Bucket").reset_index(name="Count")
+            cov_counts = cov_counts.set_index("Coverage_Bucket")
+            st.bar_chart(cov_counts)
+        else:
+            st.info("Coverage_Days column is present but contains no numeric data.")
+    else:
+        st.info("No 'Coverage_Days' column found – skipping coverage analysis.")
+
+    # =====================================================
+    #  DETAILED TABLES BY STATUS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📃 Item-Level Details by Risk Category")
+
+    tab_all, tab_short, tab_excess, tab_ok, tab_nomodel = st.tabs(
+        ["All Items", "Shortage Risk", "Excess Risk", "OK", "No-ROP-Model"]
+    )
+
+    with tab_all:
+        st.dataframe(df, use_container_width=True)
+
+    with tab_short:
+        st.write(f"Total Shortage_Risk items: **{shortage:,}**")
+        st.dataframe(df[df["Stock_Status"] == "Shortage_Risk"], use_container_width=True)
+
+    with tab_excess:
+        st.write(f"Total Excess_Risk items: **{excess:,}**")
+        st.dataframe(df[df["Stock_Status"] == "Excess_Risk"], use_container_width=True)
+
+    with tab_ok:
+        st.write(f"Total OK items: **{healthy:,}**")
+        st.dataframe(df[df["Stock_Status"] == "OK"], use_container_width=True)
+
+    with tab_nomodel:
+        st.write(f"Total No-ROP-Model items: **{no_model:,}**")
+        st.dataframe(df[df["Stock_Status"] == "No-ROP-Model"], use_container_width=True)
+
 
     # =====================================================
     #  CONFIGURE STOCKOUT / OVERSTOCK LOGIC FROM COLUMNS
@@ -476,4 +564,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
