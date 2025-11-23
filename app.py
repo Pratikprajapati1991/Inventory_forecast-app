@@ -228,7 +228,7 @@ def run_inventory_forecast_app():
     if uploaded_file is None:
         st.stop()
 
-    # Read Excel into DataFrame
+    # -------- Read Excel --------
     try:
         df = pd.read_excel(uploaded_file)
     except Exception as e:
@@ -245,8 +245,58 @@ def run_inventory_forecast_app():
     st.subheader("Dataset Preview")
     st.dataframe(df.head(), use_container_width=True)
 
-    # --------- Metrics ---------
-    # Total SKUs
+    # =====================================================
+    #  CONFIGURE STOCKOUT / OVERSTOCK LOGIC FROM COLUMNS
+    # =====================================================
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    if len(numeric_cols) < 1:
+        st.error("No numeric columns found. Cannot compute stockout/overstock.")
+        st.stop()
+
+    def guess_index(keywords):
+        for i, c in enumerate(numeric_cols):
+            cl = c.lower()
+            if any(k in cl for k in keywords):
+                return i
+        return 0
+
+    st.markdown("### ⚙ Stock Logic Configuration")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        idx_current = guess_index(["current", "stock", "qty", "quantity"])
+        current_col = st.selectbox(
+            "Select **Current Stock** column",
+            numeric_cols,
+            index=idx_current,
+        )
+    with col_b:
+        idx_min = guess_index(["min", "safety", "reorder"])
+        min_col = st.selectbox(
+            "Select **Min Level / Safety Stock** column",
+            numeric_cols,
+            index=idx_min,
+        )
+    with col_c:
+        idx_max = guess_index(["max", "target", "upper"])
+        max_col = st.selectbox(
+            "Select **Max Level** column",
+            numeric_cols,
+            index=idx_max,
+        )
+
+    # -------- Compute stock status --------
+    df = df.copy()
+    df["Stock_Status"] = "OK"
+    df.loc[df[current_col] < df[min_col], "Stock_Status"] = "Stockout"
+    df.loc[df[current_col] > df[max_col], "Stock_Status"] = "Overstock"
+
+    stockout_items = (df["Stock_Status"] == "Stockout").sum()
+    overstock_items = (df["Stock_Status"] == "Overstock").sum()
+    healthy_items = (df["Stock_Status"] == "OK").sum()
+
+    # -------- Total SKUs (by item identifier if present) --------
     total_skus = df.shape[0]
     if "Item Name" in df.columns:
         total_skus = df["Item Name"].nunique()
@@ -255,36 +305,45 @@ def run_inventory_forecast_app():
     elif "Item Code" in df.columns:
         total_skus = df["Item Code"].nunique()
 
-    # For now we keep simple placeholder logic
-    stockout_items_display = "N/A"
-    overstock_items_display = "N/A"
-
-    cols_lower = [c.lower() for c in df.columns]
-
-    try:
-        # Look for typical column names
-        if "current_stock" in cols_lower and "min_level" in cols_lower:
-            current_col = df.columns[cols_lower.index("current_stock")]
-            min_col = df.columns[cols_lower.index("min_level")]
-            stockout_items = (df[current_col] < df[min_col]).sum()
-            stockout_items_display = f"{stockout_items:,}"
-
-        if "current_stock" in cols_lower and "max_level" in cols_lower:
-            current_col = df.columns[cols_lower.index("current_stock")]
-            max_col = df.columns[cols_lower.index("max_level")]
-            overstock_items = (df[current_col] > df[max_col]).sum()
-            overstock_items_display = f"{overstock_items:,}"
-    except Exception:
-        pass  # leave as N/A if anything fails
-
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total SKUs", f"{total_skus:,}")
-    col2.metric("Stockout Risk Items", stockout_items_display)
-    col3.metric("Overstock Items", overstock_items_display)
+    col2.metric("Stockout Items", f"{stockout_items:,}")
+    col3.metric("Overstock Items", f"{overstock_items:,}")
+    col4.metric("Healthy Items", f"{healthy_items:,}")
 
+    # -------- Status chart --------
     st.markdown("---")
-    st.subheader("Full Data")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("Inventory Status Summary")
+
+    status_df = (
+        df["Stock_Status"]
+        .value_counts()
+        .reindex(["Stockout", "OK", "Overstock"])
+        .fillna(0)
+        .astype(int)
+        .rename_axis("Status")
+        .reset_index(name="Count")
+    )
+    status_df = status_df.set_index("Status")
+    st.bar_chart(status_df)
+
+    # -------- Detailed tables in tabs --------
+    st.markdown("---")
+    st.subheader("Item-Level Details")
+    tab_all, tab_stockout, tab_over = st.tabs(
+        ["All Items", "Stockout Items", "Overstock Items"]
+    )
+
+    with tab_all:
+        st.dataframe(df, use_container_width=True)
+
+    with tab_stockout:
+        st.write(f"Total stockout items: **{stockout_items}**")
+        st.dataframe(df[df["Stock_Status"] == "Stockout"], use_container_width=True)
+
+    with tab_over:
+        st.write(f"Total overstock items: **{overstock_items}**")
+        st.dataframe(df[df["Stock_Status"] == "Overstock"], use_container_width=True)
 
 
 # ======================================================
@@ -417,3 +476,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
