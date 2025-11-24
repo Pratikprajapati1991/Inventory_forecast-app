@@ -329,7 +329,7 @@ def run_inventory_forecast_app():
     if uploaded_file is None:
         st.stop()
 
-    # -------- Read Excel --------
+    # -------- Read Excel (cached) --------
     try:
         df = load_excel(uploaded_file)
     except Exception as e:
@@ -342,6 +342,216 @@ def run_inventory_forecast_app():
     # Quick preview
     with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
         st.dataframe(df.head(10), use_container_width=True)
+
+    # =====================================================
+    #  STOCK STATUS & RISK METRICS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📦 Inventory Risk Overview")
+
+    # Total SKUs
+    if "Item Name" in df.columns:
+        total_skus = df["Item Name"].nunique()
+    else:
+        total_skus = df.shape[0]
+
+    shortage = excess = healthy = no_model = 0
+    status_chart_df = None
+
+    if "Stock_Status" in df.columns:
+        status_counts = df["Stock_Status"].value_counts()
+        shortage = int(status_counts.get("Shortage_Risk", 0))
+        excess = int(status_counts.get("Excess_Risk", 0))
+        healthy = int(status_counts.get("OK", 0))
+        no_model = int(status_counts.get("No-ROP-Model", 0))
+
+        status_chart_df = (
+            status_counts.rename_axis("Status")
+            .reset_index(name="Count")
+            .set_index("Status")
+        )
+    else:
+        st.warning("Column 'Stock_Status' not found. Risk breakdown will be limited.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total SKUs", f"{total_skus:,}")
+    c2.metric("Shortage Risk", f"{shortage:,}")
+    c3.metric("Excess Risk", f"{excess:,}")
+    c4.metric("Healthy (OK)", f"{healthy:,}")
+    c5.metric("No ROP Model", f"{no_model:,}")
+
+    if status_chart_df is not None:
+        st.bar_chart(status_chart_df)
+
+    # =====================================================
+    #  COVERAGE & STOCK LEVEL INSIGHTS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("⏱ Coverage & Stock Level Insights")
+
+    if "Coverage_Days" in df.columns:
+        cov = pd.to_numeric(df["Coverage_Days"], errors="coerce").dropna()
+        if not cov.empty:
+            colA, colB, colC, colD = st.columns(4)
+            colA.metric("Avg Coverage (days)", f"{cov.mean():.1f}")
+            colB.metric("Median Coverage (days)", f"{cov.median():.1f}")
+            colC.metric("P10 (Low)", f"{cov.quantile(0.10):.0f}")
+            colD.metric("P90 (High)", f"{cov.quantile(0.90):.0f}")
+
+            st.write("Coverage days distribution (bucketed):")
+            cov_bins = pd.cut(
+                cov,
+                bins=[0, 30, 60, 90, 180, 365, cov.max()],
+                labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"]
+            )
+            cov_counts = (
+                cov_bins.value_counts()
+                .sort_index()
+                .rename_axis("Coverage_Bucket")
+                .reset_index(name="Count")
+                .set_index("Coverage_Bucket")
+            )
+            st.bar_chart(cov_counts)
+        else:
+            st.info("Coverage_Days column is present but has no numeric values.")
+    else:
+        st.info("No 'Coverage_Days' column found – skipping coverage analysis.")
+
+    # =====================================================
+    #  DETAILED TABLES BY STATUS
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📃 Item-Level Details by Risk Category")
+
+    if "Stock_Status" in df.columns:
+        tab_all, tab_short, tab_excess, tab_ok, tab_nomodel = st.tabs(
+            ["All Items", "Shortage Risk", "Excess Risk", "OK", "No-ROP-Model"]
+        )
+
+        with tab_all:
+            st.dataframe(df, use_container_width=True)
+
+        with tab_short:
+            st.write(f"Total Shortage_Risk items: **{shortage:,}**")
+            st.dataframe(df[df["Stock_Status"] == "Shortage_Risk"], use_container_width=True)
+
+        with tab_excess:
+            st.write(f"Total Excess_Risk items: **{excess:,}**")
+            st.dataframe(df[df["Stock_Status"] == "Excess_Risk"], use_container_width=True)
+
+        with tab_ok:
+            st.write(f"Total OK items: **{healthy:,}**")
+            st.dataframe(df[df["Stock_Status"] == "OK"], use_container_width=True)
+
+        with tab_nomodel:
+            st.write(f"Total No-ROP-Model items: **{no_model:,}**")
+            st.dataframe(df[df["Stock_Status"] == "No-ROP-Model"], use_container_width=True)
+    else:
+        st.dataframe(df, use_container_width=True)
+
+    # =====================================================
+    #  FORECAST OVERVIEW (3M / 6M / 12M)
+    # =====================================================
+    st.markdown("---")
+    st.subheader("📈 Forecast Overview")
+
+    forecast_cols = ["forecast_3M", "forecast_6M", "forecast_12M"]
+    missing_forecast = [c for c in forecast_cols if c not in df.columns]
+
+    if missing_forecast:
+        st.info(
+            f"Forecast columns missing: {', '.join(missing_forecast)}. "
+            "Skipping forecast charts."
+        )
+    else:
+        fdf = df.copy()
+        for c in forecast_cols:
+            fdf[c] = pd.to_numeric(fdf[c], errors="coerce")
+
+        totals = fdf[forecast_cols].sum()
+
+        colF1, colF2, colF3, colF4 = st.columns(4)
+        colF1.metric("Total Forecast 3M", f"{totals['forecast_3M']:.0f}")
+        colF2.metric("Total Forecast 6M", f"{totals['forecast_6M']:.0f}")
+        colF3.metric("Total Forecast 12M", f"{totals['forecast_12M']:.0f}")
+        colF4.metric("Avg Monthly Forecast (12M)", f"{(totals['forecast_12M'] / 12):.0f}")
+
+        agg_forecast_df = (
+            totals.rename_axis("Horizon")
+            .reset_index(name="Quantity")
+            .set_index("Horizon")
+        )
+        st.bar_chart(agg_forecast_df)
+
+        # -------------------------------------------------
+        #  ITEM-WISE FORECAST EXPLORER
+        # -------------------------------------------------
+        st.markdown("### 🔍 Item-wise Forecast Explorer")
+
+        if "Item Name" in fdf.columns:
+            fdf_nonzero = fdf[
+                (fdf["forecast_3M"] > 0)
+                | (fdf["forecast_6M"] > 0)
+                | (fdf["forecast_12M"] > 0)
+            ]
+            if fdf_nonzero.empty:
+                st.info("No items with non-zero forecast values.")
+            else:
+                fdf_nonzero = fdf_nonzero.sort_values("forecast_12M", ascending=False)
+                item_list = fdf_nonzero["Item Name"].unique().tolist()
+                selected_item = st.selectbox(
+                    "Select an item (sorted by highest 12M forecast)",
+                    item_list,
+                    key="forecast_item_select",
+                )
+
+                row = fdf_nonzero[fdf_nonzero["Item Name"] == selected_item].iloc[0]
+
+                values = {}
+                if "On_Hand_Qty" in row.index:
+                    values["On Hand"] = row["On_Hand_Qty"]
+                values["Forecast 3M"] = row["forecast_3M"]
+                values["Forecast 6M"] = row["forecast_6M"]
+                values["Forecast 12M"] = row["forecast_12M"]
+
+                item_chart_df = (
+                    pd.Series(values)
+                    .rename_axis("Horizon")
+                    .reset_index(name="Quantity")
+                    .set_index("Horizon")
+                )
+
+                st.write(f"**Item:** {selected_item}")
+                st.bar_chart(item_chart_df)
+
+                info_cols = [
+                    "Item Name",
+                    "Item Description",
+                    "On_Hand_Qty",
+                    "Min_Stock",
+                    "Max_Stock",
+                    "Coverage_Days",
+                    "Stock_Status",
+                    "forecast_3M",
+                    "forecast_6M",
+                    "forecast_12M",
+                    "Rec_Vendor_Name",
+                    "Rec_Vendor_Price_USD",
+                    "Rec_Vendor_LeadTime_Days",
+                    "Rec_Vendor_OnTime_Percent",
+                    "Rec_Vendor_Reliability_Score",
+                    "Rec_Vendor_Composite_Score",
+                ]
+                info_cols = [c for c in info_cols if c in row.index]
+
+                st.write("**Item details:**")
+                st.dataframe(
+                    pd.DataFrame(row[info_cols]).T,
+                    use_container_width=True,
+                )
+        else:
+            st.info("Column 'Item Name' not found, cannot build item-wise explorer.")
+
     # =====================================================
     #  🤖 LOCAL ASSISTANT – FAST ITEM INSIGHTS (NO API CALL)
     # =====================================================
@@ -382,8 +592,7 @@ def run_inventory_forecast_app():
     v_rel = item_data.get("Rec_Vendor_Reliability_Score", None)
     v_comp = item_data.get("Rec_Vendor_Composite_Score", None)
 
-    # ---- Build rule-based insights (instant, no network) ----
-    # 1. Stock health text
+    # ---- 1. Stock health text ----
     stock_summary = []
     if on_hand is not None and min_stock is not None and max_stock is not None:
         try:
@@ -405,7 +614,7 @@ def run_inventory_forecast_app():
     elif "no-rop" in status.lower():
         stock_summary.append("ℹ Stock_Status is **No-ROP-Model** – reorder policy not defined, review settings.")
 
-    # 2. Coverage interpretation
+    # ---- 2. Coverage interpretation ----
     coverage_text = []
     try:
         if cov_days is not None:
@@ -420,7 +629,7 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # 3. Forecast trend (3M vs 6M vs 12M)
+    # ---- 3. Forecast trend ----
     forecast_text = []
     try:
         if f3 is not None and f6 is not None and f12 is not None:
@@ -433,7 +642,7 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # 4. Vendor assessment
+    # ---- 4. Vendor assessment ----
     vendor_text = []
     vendor_text.append(f"Primary recommended vendor: **{vendor}**.")
     try:
@@ -461,7 +670,7 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # 5. Simple action recommendation
+    # ---- 5. Action recommendation ----
     recommendation_lines = []
     try:
         if status.lower().startswith("shortage") or (on_hand is not None and min_stock is not None and on_hand < min_stock):
@@ -507,7 +716,6 @@ def run_inventory_forecast_app():
     st.markdown("#### 5. Recommended Next Action")
     for line in recommendation_lines:
         st.write(line)
-
 
     # Convert row to dictionary for easier use
     item_data = item_row.to_dict()
@@ -1036,6 +1244,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
