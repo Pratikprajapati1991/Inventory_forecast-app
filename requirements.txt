@@ -6,3 +6,5 @@ openpyxl
 pyarrow
 requests
 bcrypt
+openai
+
