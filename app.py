@@ -614,10 +614,10 @@ def run_inventory_forecast_app():
             st.info("Column 'Item Name' not found, cannot build item-wise explorer.")
 
     # =====================================================
-    #  🤖 LOCAL ASSISTANT – FAST ITEM INSIGHTS (NO API CALL)
+    #  🤖 Item Insights (Local – Instant) + Reorder Calculator
     # =====================================================
     st.markdown("---")
-    st.subheader("🤖 Item Insights (Local – Instant)")
+    st.subheader("🤖 Item Insights (Local – Instant) + Reorder Suggestion")
 
     if "Item Name" not in df.columns:
         st.info("Item insights require an 'Item Name' column.")
@@ -731,7 +731,7 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # ---- 5. Action recommendation ----
+    # ---- 5. Action recommendation (qualitative) ----
     recommendation_lines = []
     try:
         if status.lower().startswith("shortage") or (on_hand is not None and min_stock is not None and on_hand < min_stock):
@@ -744,6 +744,51 @@ def run_inventory_forecast_app():
             recommendation_lines.append("ℹ **Action:** Review item parameters (Min/Max, forecast, vendor) before deciding.")
     except Exception:
         pass
+
+    # ---- 6. Reorder quantity calculator (simple ROP model) ----
+    # Logic:
+    #  - Monthly demand ≈ forecast_12M / 12 (fallback to 6M / 3M if needed)
+    #  - Lead time in months = Rec_Vendor_LeadTime_Days / 30 (fallback 30 days)
+    #  - Reorder point = monthly_demand * lead_time_months + safety_stock (Min_Stock)
+    #  - Target level = Max_Stock (if available) else 1.5 * reorder_point
+    #  - Recommended order = max(0, target_level - On_Hand_Qty)
+    monthly_demand = None
+    try:
+        if f12 is not None and f12 > 0:
+            monthly_demand = f12 / 12
+        elif f6 is not None and f6 > 0:
+            monthly_demand = f6 / 6
+        elif f3 is not None and f3 > 0:
+            monthly_demand = f3 / 3
+    except Exception:
+        monthly_demand = None
+
+    lead_time_days = v_lead if v_lead is not None else 30
+    lead_time_months = None
+    try:
+        if lead_time_days is not None and lead_time_days > 0:
+            lead_time_months = lead_time_days / 30.0
+    except Exception:
+        lead_time_months = None
+
+    reorder_point = None
+    target_level = None
+    recommended_order = None
+
+    if monthly_demand is not None and lead_time_months is not None and on_hand is not None:
+        safety_stock = min_stock if min_stock is not None else 0
+        try:
+            reorder_point = monthly_demand * lead_time_months + safety_stock
+            if max_stock is not None and max_stock > 0:
+                target_level = max_stock
+            else:
+                target_level = reorder_point * 1.5
+
+            recommended_order = max(0, target_level - on_hand)
+        except Exception:
+            reorder_point = None
+            target_level = None
+            recommended_order = None
 
     # ---- Display nicely ----
     st.markdown(f"### 🧾 Summary for: **{name}**")
@@ -774,9 +819,27 @@ def run_inventory_forecast_app():
     for line in vendor_text:
         st.write(line)
 
-    st.markdown("#### 5. Recommended Next Action")
+    st.markdown("#### 5. Recommended Next Action (Qualitative)")
     for line in recommendation_lines:
         st.write(line)
+
+    # ---- 7. Reorder quantity output ----
+    st.markdown("#### 6. Reorder Quantity Suggestion")
+
+    if recommended_order is not None and reorder_point is not None and target_level is not None:
+        colR1, colR2, colR3, colR4 = st.columns(4)
+        colR1.metric("On Hand Qty", f"{on_hand:.0f}" if on_hand is not None else "N/A")
+        colR2.metric("Reorder Point (approx.)", f"{reorder_point:.0f}")
+        colR3.metric("Target Stock Level", f"{target_level:.0f}")
+        colR4.metric("Suggested Order Qty", f"{recommended_order:.0f}")
+
+        if recommended_order > 0:
+            st.write("✅ Suggested action: **Place a PO** approximately for the suggested order quantity.")
+        else:
+            st.write("🟢 Suggested action: **No immediate PO** required based on current stock vs target.")
+    else:
+        st.write("ℹ Not enough data to compute a reliable reorder quantity (missing forecast, lead time, or stock values).")
+
 
     # Convert row to dictionary for easier use
     item_data = item_row.to_dict()
@@ -1306,6 +1369,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
