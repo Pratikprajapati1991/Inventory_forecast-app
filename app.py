@@ -68,6 +68,43 @@ def init_user_db():
         """
     )
     conn.commit()
+# =========================================
+#  PLANNING FILE STORAGE (in users.db)
+# =========================================
+
+def init_planning_table():
+    """Create table to store uploaded planning files (once)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS planning_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            file_data BLOB NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_planning_file(filename: str, file_bytes: bytes):
+    """Save uploaded planning file into SQLite."""
+    from datetime import datetime
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO planning_files (filename, uploaded_at, file_data)
+        VALUES (?, ?, ?)
+        """,
+        (filename, datetime.utcnow().isoformat(), file_bytes),
+    )
+    conn.commit()
+    conn.close()
 
     # Ensure default admin exists
     cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
@@ -353,6 +390,12 @@ def run_inventory_forecast_app():
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
+        # Save raw uploaded file into database (permanent storage)
+    try:
+        save_planning_file(uploaded_file.name, uploaded_file.getvalue())
+        st.info("📦 This planning file has been saved in the database.")
+    except Exception as e:
+        st.warning(f"Could not save file in database: {e}")
 
     st.success(f"File loaded: {uploaded_file.name}")
     st.write(f"Rows: **{df.shape[0]}**, Columns: **{df.shape[1]}**")
@@ -1234,6 +1277,7 @@ def admin_panel():
 # ======================================================
 def main():
     init_user_db()
+    init_planning_table()
     init_session_state()
 
     if not st.session_state.logged_in:
@@ -1262,6 +1306,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
