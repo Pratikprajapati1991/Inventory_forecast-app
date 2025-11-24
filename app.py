@@ -8,6 +8,10 @@ import sqlite3
 import bcrypt
 from datetime import datetime
 
+@st.cache_data(show_spinner=False)
+def load_excel(file):
+    import pandas as pd
+    return pd.read_excel(file)
 # ======================================================
 # BASIC CONFIG
 # ======================================================
@@ -327,7 +331,7 @@ def run_inventory_forecast_app():
 
     # -------- Read Excel --------
     try:
-        df = pd.read_excel(uploaded_file)
+        df = load_excel(uploaded_file)
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
@@ -1032,6 +1036,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
