@@ -7,6 +7,7 @@ import pandas as pd
 import sqlite3
 import bcrypt
 from datetime import datetime
+from openai import OpenAI
 
 @st.cache_data(show_spinner=False)
 def load_excel(file):
@@ -213,6 +214,12 @@ def init_session_state():
     if "role" not in st.session_state:
         st.session_state.role = None
 
+def get_openai_client():
+    """Return an OpenAI client if API key is configured, otherwise None."""
+    api_key = st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
 
 def require_login():
     if not st.session_state.get("logged_in", False):
@@ -1340,6 +1347,55 @@ def admin_panel():
         "- Per-page permissions"
     )
 
+def ai_chat_page():
+    """Simple AI chat page for supply chain & inventory questions."""
+    require_login()
+
+    st.header("🤖 AI Chat Assistant")
+
+    st.write(
+        "Ask any question related to inventory, forecasting, vendor selection, "
+        "min–max levels, or supply chain planning."
+    )
+
+    client = get_openai_client()
+    if client is None:
+        st.warning(
+            "OPENAI_API_KEY is not configured in secrets.toml. "
+            "Please add it there to use the AI chat."
+        )
+        return
+
+    user_question = st.text_area("Your question", height=120)
+
+    if st.button("Ask"):
+        if not user_question.strip():
+            st.error("Please enter a question.")
+            return
+
+        with st.spinner("Thinking..."):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a senior supply chain and inventory planning expert. "
+                                "Answer clearly, practically, and step-by-step. "
+                                "If user mentions stockout, min/max, coverage, or vendors, "
+                                "give concrete actions they can take."
+                            ),
+                        },
+                        {"role": "user", "content": user_question},
+                    ],
+                    max_tokens=500,
+                )
+                answer = response.choices[0].message["content"]
+                st.markdown("### 💬 Answer")
+                st.write(answer)
+            except Exception as e:
+                st.error(f"Error while contacting AI service: {e}")
 
 # ======================================================
 # MAIN ROUTER
@@ -1358,7 +1414,7 @@ def main():
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
 
-    menu = ["Dashboard"]
+        menu = ["Dashboard", "AI Assistant"]
     if is_admin():
         menu.append("Admin Panel")
     menu.append("Logout")
@@ -1367,14 +1423,16 @@ def main():
 
     if choice == "Dashboard":
         run_inventory_forecast_app()
+    elif choice == "AI Assistant":
+        ai_chat_page()
     elif choice == "Admin Panel":
         admin_panel()
     elif choice == "Logout":
         logout()
 
-
 if __name__ == "__main__":
     main()
+
 
 
 
