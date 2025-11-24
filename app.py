@@ -7,7 +7,6 @@ import pandas as pd
 import sqlite3
 import bcrypt
 from datetime import datetime
-from openai import OpenAI
 
 @st.cache_data(show_spinner=False)
 def load_excel(file):
@@ -1348,54 +1347,119 @@ def admin_panel():
     )
 
 def ai_chat_page():
-    """Simple AI chat page for supply chain & inventory questions."""
+    """Local, fast AI-style assistant (no external API)."""
     require_login()
 
-    st.header("🤖 AI Chat Assistant")
+    st.header("🤖 AI Assistant (Local)")
 
     st.write(
-        "Ask any question related to inventory, forecasting, vendor selection, "
-        "min–max levels, or supply chain planning."
+        "Ask any question related to inventory, min–max, stockouts, coverage, "
+        "vendor performance, or planning logic.\n\n"
+        "This assistant uses rule-based logic from your supply-chain domain, "
+        "so it is fast and does not require internet or API keys."
     )
 
-    client = get_openai_client()
-    if client is None:
-        st.warning(
-            "OPENAI_API_KEY is not configured in secrets.toml. "
-            "Please add it there to use the AI chat."
-        )
-        return
+    question = st.text_area("Your question", height=120, key="ai_chat_question")
 
-    user_question = st.text_area("Your question", height=120)
-
-    if st.button("Ask"):
-        if not user_question.strip():
-            st.error("Please enter a question.")
+    if st.button("Ask", key="ai_chat_button"):
+        q = (question or "").strip()
+        if not q:
+            st.error("Please type a question first.")
             return
 
-        with st.spinner("Thinking..."):
-            try:
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a senior supply chain and inventory planning expert. "
-                                "Answer clearly, practically, and step-by-step. "
-                                "If user mentions stockout, min/max, coverage, or vendors, "
-                                "give concrete actions they can take."
-                            ),
-                        },
-                        {"role": "user", "content": user_question},
-                    ],
-                    max_tokens=500,
-                )
-                answer = response.choices[0].message["content"]
-                st.markdown("### 💬 Answer")
-                st.write(answer)
-            except Exception as e:
-                st.error(f"Error while contacting AI service: {e}")
+        q_low = q.lower()
+        answers = []
+
+        # --- Stockout / shortage questions ---
+        if "stockout" in q_low or "stock out" in q_low or "shortage" in q_low:
+            answers.append(
+                "### 🔴 Handling Stockouts / Shortage Risk\n"
+                "- Identify SKUs with `Stock_Status = Shortage_Risk` and very low `Coverage_Days` (e.g. < 15 days).\n"
+                "- Check `On_Hand_Qty` vs `Min_Stock`. If On Hand < Min Stock, plan an urgent PO.\n"
+                "- Use recommended vendor fields: `Rec_Vendor_Name`, `Rec_Vendor_LeadTime_Days`, "
+                "`Rec_Vendor_OnTime_Percent` to choose the fastest and most reliable vendor.\n"
+                "- If lead time is long, consider partial shipment or alternate vendor to reduce risk.\n"
+                "- Communicate risk items to production and planning so they can adjust schedules."
+            )
+
+        # --- Excess / overstock questions ---
+        if "overstock" in q_low or "excess" in q_low or "slow moving" in q_low:
+            answers.append(
+                "### 🟠 Handling Excess / Overstock\n"
+                "- Filter items with `Stock_Status = Excess_Risk` and very high `Coverage_Days` (e.g. > 180 days).\n"
+                "- Compare `On_Hand_Qty` vs `Max_Stock`. If On Hand >> Max Stock, put the item on PO hold.\n"
+                "- Reduce or postpone new orders, especially from vendors with long lead times.\n"
+                "- Discuss consumption plan with users: can these items be substituted or used in other lines?\n"
+                "- Plan liquidation, scrap review, or alternate use for extremely high coverage items."
+            )
+
+        # --- Min / Max questions ---
+        if "min" in q_low and "max" in q_low:
+            answers.append(
+                "### 📏 Setting Min / Max Levels\n"
+                "- Use forecast columns (`forecast_3M`, `forecast_6M`, `forecast_12M`) to estimate demand.\n"
+                "- Monthly demand ≈ `forecast_12M / 12` (or `forecast_6M / 6` if 12M is not stable).\n"
+                "- Reorder point (ROP) ≈ Demand during lead time + safety stock.\n"
+                "  - Demand during lead time ≈ Monthly demand × (LeadTimeDays / 30).\n"
+                "  - Safety stock can be approximated by current `Min_Stock` or a % of average monthly demand.\n"
+                "- Set `Min_Stock` near the ROP and `Max_Stock` as 1.5–2 × Min for critical items, "
+                "lower for non-critical.\n"
+                "- Review Min/Max regularly for high-variance items with big swings in forecast."
+            )
+
+        # --- Vendor performance questions ---
+        if "vendor" in q_low or "supplier" in q_low:
+            answers.append(
+                "### 🧑‍💼 Vendor Performance & Selection\n"
+                "- Use `Rec_Vendor_OnTime_Percent`, `Rec_Vendor_Reliability_Score`, and "
+                "`Rec_Vendor_Composite_Score` to compare vendors.\n"
+                "- For critical items, prefer vendors with On Time > 90% and high reliability scores.\n"
+                "- If price is higher but reliability is much better, highlight total cost of stockout "
+                "vs small price difference.\n"
+                "- For poor-performing vendors (low on-time, low reliability), consider:\n"
+                "  - reducing volumes,\n"
+                "  - using them only for non-critical items,\n"
+                "  - or developing alternate vendors."
+            )
+
+        # --- Coverage / planning questions ---
+        if "coverage" in q_low or "days" in q_low:
+            answers.append(
+                "### ⏱ Coverage Days Interpretation\n"
+                "- `Coverage_Days` < 15: Very high risk of stockout → expedite PO or increase order quantity.\n"
+                "- 15–45 days: Moderate coverage → keep monitoring but do not over-order.\n"
+                "- 45–120 days: Healthy coverage for most items.\n"
+                "- > 120 days: Potential overstock → slow or stop new orders, check demand assumptions.\n"
+                "- Use coverage together with Stock_Status to prioritise actions."
+            )
+
+        # --- Reorder quantity / PO recommendation ---
+        if "reorder" in q_low or "po" in q_low or "purchase order" in q_low or "order quantity" in q_low:
+            answers.append(
+                "### 📦 Reorder Quantity & PO Recommendation\n"
+                "- Estimate monthly demand from forecast (12M or 6M horizon).\n"
+                "- Reorder point = monthly demand × (LeadTimeDays / 30) + safety stock.\n"
+                "- Target stock level can be Max_Stock, or 1.5 × ROP if Max is not defined.\n"
+                "- Recommended order ≈ max(0, TargetStock − OnHand).\n"
+                "- For very expensive or slow-moving items, reduce Max_Stock and order more frequently in smaller lots."
+            )
+
+        # --- Generic / fallback answer ---
+        if not answers:
+            answers.append(
+                "### 🧠 General Guidance\n"
+                "- Focus first on items with `Shortage_Risk` and low `Coverage_Days` – these directly affect production.\n"
+                "- Next, look at `Excess_Risk` items with very high coverage to free up working capital.\n"
+                "- Use the dashboard's Item Insights & Reorder Suggestion for item-level actions.\n"
+                "- If you describe a specific scenario with numbers (On_Hand, Min, Max, forecast, lead time), "
+                "I can give a more concrete step-by-step recommendation."
+            )
+
+        full_answer = "\n\n".join(answers)
+
+        st.markdown("### 💬 Answer")
+        st.markdown(full_answer)
+    
 
 # ======================================================
 # MAIN ROUTER
@@ -1439,6 +1503,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
