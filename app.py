@@ -1,7 +1,3 @@
-import secrets
-import string
-import smtplib
-from email.mime.text import MIMEText
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -94,19 +90,16 @@ def init_planning_table():
 
 def save_planning_file(filename: str, file_bytes: bytes):
     """Save uploaded planning file into SQLite (separate connection)."""
-    try:
-        with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO planning_files (filename, uploaded_at, file_data)
-                VALUES (?, ?, ?)
-                """,
-                (filename, datetime.utcnow().isoformat(), file_bytes),
-            )
-            conn.commit()
-    except Exception as e:
-        raise e
+    with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO planning_files (filename, uploaded_at, file_data)
+            VALUES (?, ?, ?)
+            """,
+            (filename, datetime.utcnow().isoformat(), file_bytes),
+        )
+        conn.commit()
 
 
 def get_latest_planning_file() -> Optional[Tuple[str, bytes, str]]:
@@ -223,7 +216,7 @@ def logout():
     st.session_state.username = None
     st.session_state.role = "viewer"
     st.success("You have been logged out.")
-    st.experimental_rerun()
+    st.rerun()
 
 
 # ======================================================
@@ -291,7 +284,7 @@ def login_screen():
                 st.session_state.username = user["username"]
                 st.session_state.role = user["role"]
                 st.success(f"Welcome, {user['username']} ({user['role'].title()})!")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Invalid username or password")
 
@@ -341,7 +334,7 @@ def admin_panel():
             ok, msg = create_user(new_username, new_email, new_password, new_role)
             if ok:
                 st.success(msg)
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error(msg)
 
@@ -357,7 +350,7 @@ def admin_panel():
         if st.button("Update Status"):
             set_user_active(selected_user["id"], desired_state)
             st.success("User status updated.")
-            st.experimental_rerun()
+            st.rerun()
 
 
 # ======================================================
