@@ -12,6 +12,23 @@ from datetime import datetime
 def load_excel(file):
     import pandas as pd
     return pd.read_excel(file)
+
+@st.cache_data(show_spinner=False)
+def preprocess_df(df):
+    """Pre-calculate stock status, coverage buckets, forecast totals etc. to avoid reprocessing."""
+    dfc = df.copy()
+
+    # numeric conversions
+    numeric_cols = [
+        "On_Hand_Qty", "Min_Stock", "Max_Stock", "Coverage_Days",
+        "forecast_3M", "forecast_6M", "forecast_12M"
+    ]
+    for col in numeric_cols:
+        if col in dfc.columns:
+            dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
+
+    return dfc
+
 # ======================================================
 # BASIC CONFIG
 # ======================================================
@@ -331,7 +348,8 @@ def run_inventory_forecast_app():
 
     # -------- Read Excel (cached) --------
     try:
-        df = load_excel(uploaded_file)
+        df_raw = load_excel(uploaded_file)
+        df = preprocess_df(df_raw)
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
@@ -1244,6 +1262,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
