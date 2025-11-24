@@ -110,6 +110,31 @@ def save_planning_file(filename: str, file_bytes: bytes):
     except Exception as e:
         # Let caller decide how to show the message
         raise e
+import sqlite3
+import io
+
+# ... your existing code ...
+
+def get_latest_planning_file():
+    """
+    Return (filename, file_data, uploaded_at) of the most recently saved planning file,
+    or None if there is no file.
+    """
+    try:
+        with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT filename, file_data, uploaded_at
+                FROM planning_files
+                ORDER BY datetime(uploaded_at) DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+        return row  # either (filename, file_data, uploaded_at) or None
+    except Exception:
+        return None
 
     # Ensure default admin exists
     cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
@@ -211,7 +236,8 @@ def init_session_state():
     if "username" not in st.session_state:
         st.session_state.username = None
     if "role" not in st.session_state:
-        st.session_state.role = None
+        st.session_state.role = "viewer"
+
 
 def get_openai_client():
     """Return an OpenAI client if API key is configured, otherwise None."""
@@ -391,8 +417,27 @@ def run_inventory_forecast_app():
         help="Upload your final planning master file."
     )
 
-    if uploaded_file is None:
-        st.stop()
+    source = None  # "upload" or "db"
+
+    if uploaded_file is not None:
+        # User has uploaded a new file in this session
+        source = "upload"
+    else:
+        # Try to fetch the latest saved file from the database
+        latest = get_latest_planning_file()
+        if latest is not None:
+            filename, file_bytes, uploaded_at = latest
+            st.info(
+                f"📂 Using last saved planning file: **{filename}** "
+                f"(uploaded at {uploaded_at} UTC). Upload a new file to override."
+            )
+            buffer = io.BytesIO(file_bytes)
+            buffer.name = filename  # so pandas & our code see a name
+            uploaded_file = buffer
+            source = "db"
+        else:
+            st.warning("No file uploaded and no saved file found. Please upload a planning Excel file.")
+            st.stop()
 
     # -------- Read Excel (cached) --------
     try:
@@ -401,6 +446,15 @@ def run_inventory_forecast_app():
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
+
+    # -------- Save file to database only when it is a new upload --------
+    if source == "upload":
+        try:
+            save_planning_file(uploaded_file.name, uploaded_file.getvalue())
+            st.info("📦 This planning file has been saved in the database.")
+        except Exception as e:
+            st.warning(f"Could not save file in database: {e}")
+
     
     # Save raw uploaded file into database (permanent storage)
     try:
@@ -1503,6 +1557,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
