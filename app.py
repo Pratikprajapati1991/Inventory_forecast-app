@@ -1405,33 +1405,41 @@ def main():
     init_planning_table()
     init_session_state()
 
+    # If not logged in, show login screen and exit
     if not st.session_state.logged_in:
         login_screen()
         return
 
-    # Logged in: show sidebar + pages
+    # ---------------- Sidebar navigation ----------------
     st.sidebar.title("Navigation")
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
 
-        menu = ["Dashboard", "AI Assistant"]
+    # Menu options
+    menu = ["Dashboard", "AI Assistant"]
     if is_admin():
         menu.append("Admin Panel")
     menu.append("Logout")
 
     choice = st.sidebar.radio("Go to", menu)
 
+    # ---------------- Routing ----------------
     if choice == "Dashboard":
         run_inventory_forecast_app()
     elif choice == "AI Assistant":
         ai_chat_page()
     elif choice == "Admin Panel":
-        admin_panel()
+        # Extra safety: only admins should see this, but check again
+        if is_admin():
+            admin_panel()
+        else:
+            st.error("You are not authorized to view this page.")
     elif choice == "Logout":
         logout()
 
 if __name__ == "__main__":
     main()
+
 
 
 
