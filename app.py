@@ -7,53 +7,33 @@ import pandas as pd
 import sqlite3
 import bcrypt
 from datetime import datetime
-
-@st.cache_data(show_spinner=False)
-def load_excel(file):
-    import pandas as pd
-    return pd.read_excel(file)
-
-@st.cache_data(show_spinner=False)
-def preprocess_df(df):
-    """Pre-calculate stock status, coverage buckets, forecast totals etc. to avoid reprocessing."""
-    dfc = df.copy()
-
-    # numeric conversions
-    numeric_cols = [
-        "On_Hand_Qty", "Min_Stock", "Max_Stock", "Coverage_Days",
-        "forecast_3M", "forecast_6M", "forecast_12M"
-    ]
-    for col in numeric_cols:
-        if col in dfc.columns:
-            dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
-
-    return dfc
+import io
+from typing import Optional, Tuple, List
 
 # ======================================================
-# BASIC CONFIG
+#  BASIC CONFIG
 # ======================================================
+DB_PATH = "users.db"
+
 st.set_page_config(
-    page_title="Inventory Forecast App",
+    page_title="Inventory Forecast & Planning",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-DB_PATH = "users.db"   # SQLite file for users
-
 
 # ======================================================
-# DATABASE HELPERS
+#  DATABASE HELPERS
 # ======================================================
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 def init_user_db():
-    """Create users table if it doesn't exist and ensure an admin user."""
+    """Create users table and default admin user."""
     conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -68,12 +48,34 @@ def init_user_db():
         """
     )
     conn.commit()
-# =========================================
-#  PLANNING FILE STORAGE (in users.db)
-# =========================================
+
+    # Ensure default admin
+    cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
+    admin = cur.fetchone()
+    if not admin:
+        default_password = "Pratik@123"
+        password_hash = bcrypt.hashpw(default_password.encode("utf-8"), bcrypt.gensalt())
+        cur.execute(
+            """
+            INSERT INTO users (username, email, password_hash, role, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "admin",
+                "admin@example.com",
+                password_hash,
+                "admin",
+                1,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+
+    conn.close()
+
 
 def init_planning_table():
-    """Create table to store uploaded planning files (once)."""
+    """Create table to store uploaded planning files."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -91,12 +93,8 @@ def init_planning_table():
 
 
 def save_planning_file(filename: str, file_bytes: bytes):
-    """Save uploaded planning file into SQLite (robust, own connection)."""
-    from datetime import datetime
-    import sqlite3
-
+    """Save uploaded planning file into SQLite (separate connection)."""
     try:
-        # Open a fresh connection just for this insert
         with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -108,18 +106,11 @@ def save_planning_file(filename: str, file_bytes: bytes):
             )
             conn.commit()
     except Exception as e:
-        # Let caller decide how to show the message
         raise e
-import sqlite3
-import io
 
-# ... your existing code ...
 
-def get_latest_planning_file():
-    """
-    Return (filename, file_data, uploaded_at) of the most recently saved planning file,
-    or None if there is no file.
-    """
+def get_latest_planning_file() -> Optional[Tuple[str, bytes, str]]:
+    """Return (filename, file_data, uploaded_at) of the latest saved file."""
     try:
         with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
             cur = conn.cursor()
@@ -132,60 +123,19 @@ def get_latest_planning_file():
                 """
             )
             row = cur.fetchone()
-        return row  # either (filename, file_data, uploaded_at) or None
+        if row:
+            return row[0], row[1], row[2]
+        return None
     except Exception:
         return None
 
-    # Ensure default admin exists
-    cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
-    admin = cur.fetchone()
-    if not admin:
-        default_password = "Pratik@123"
-        password_hash = bcrypt.hashpw(default_password.encode("utf-8"), bcrypt.gensalt())
-        cur.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "admin",
-                "admin@example.com",
-                password_hash,
-                "admin",
-                1,
-                datetime.utcnow().isoformat()
-            ),
-        )
-        conn.commit()
-    conn.close()
 
-
-def create_user(username, email, password, role="viewer"):
+# ======================================================
+#  USER MANAGEMENT HELPERS
+# ======================================================
+def get_user_by_username(username: str):
     conn = get_connection()
-    cur = conn.cursor()
-    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role, is_active, created_at)
-            VALUES (?, ?, ?, ?, 1, ?)
-            """,
-            (username, email, password_hash, role, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        return True, "User created successfully."
-    except sqlite3.IntegrityError as e:
-        if "UNIQUE constraint failed: users.username" in str(e):
-            return False, "Username already exists."
-        if "UNIQUE constraint failed: users.email" in str(e):
-            return False, "Email already exists."
-        return False, f"Database error: {e}"
-    finally:
-        conn.close()
-
-
-def get_user_by_username(username):
-    conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE username = ?", (username,))
     row = cur.fetchone()
@@ -193,8 +143,9 @@ def get_user_by_username(username):
     return row
 
 
-def list_users():
+def get_all_users() -> List[sqlite3.Row]:
     conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT * FROM users ORDER BY created_at DESC")
     rows = cur.fetchall()
@@ -202,33 +153,51 @@ def list_users():
     return rows
 
 
-def set_user_active(username, is_active: bool):
+def create_user(username: str, email: str, password: str, role: str = "viewer") -> Tuple[bool, str]:
+    if not username or not password:
+        return False, "Username and password are required."
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+    if cur.fetchone():
+        conn.close()
+        return False, "Username already exists."
+
+    if email:
+        cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
+        if cur.fetchone():
+            conn.close()
+            return False, "Email already exists."
+
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    cur.execute(
+        """
+        INSERT INTO users (username, email, password_hash, role, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (username, email, password_hash, role, 1, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return True, "User created successfully."
+
+
+def set_user_active(user_id: int, active: bool):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE users SET is_active = ? WHERE username = ?",
-        (1 if is_active else 0, username),
+        "UPDATE users SET is_active = ? WHERE id = ?",
+        (1 if active else 0, user_id),
     )
     conn.commit()
     conn.close()
 
 
-def delete_user(username):
-    if username == "admin":
-        return False, "Cannot delete default admin user."
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE username = ?", (username,))
-    conn.commit()
-    deleted = cur.rowcount
-    conn.close()
-    if deleted:
-        return True, "User deleted."
-    return False, "User not found."
-
-
 # ======================================================
-# SESSION HELPERS
+#  SESSION STATE
 # ======================================================
 def init_session_state():
     if "logged_in" not in st.session_state:
@@ -239,71 +208,78 @@ def init_session_state():
         st.session_state.role = "viewer"
 
 
-def get_openai_client():
-    """Return an OpenAI client if API key is configured, otherwise None."""
-    api_key = st.secrets.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+def is_admin() -> bool:
+    return st.session_state.get("role") == "admin"
+
 
 def require_login():
     if not st.session_state.get("logged_in", False):
-        st.warning("Please log in to continue.")
+        st.warning("You must be logged in to view this page.")
         st.stop()
 
 
-def is_admin():
-    return st.session_state.get("role") == "admin"
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.session_state.role = "viewer"
+    st.success("You have been logged out.")
+    st.experimental_rerun()
 
-# =========================================
-#  EMAIL + OTP HELPERS
-# =========================================
-
-def send_email(to_email, subject, body):
-    """Send an email using SMTP details from secrets.toml."""
-    if "email" not in st.secrets:
-        st.error("❌ Email settings missing in secrets.toml.")
-        return False
-
-    cfg = st.secrets["email"]
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = cfg["from_address"]
-    msg["To"] = to_email
-
-    try:
-        with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-            server.starttls()
-            server.login(cfg["username"], cfg["password"])
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        st.error(f"❌ Failed to send email: {e}")
-        return False
-
-
-def generate_otp(length=6):
-    """Generate a numeric OTP."""
-    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 # ======================================================
-# LOGIN / LOGOUT UI
+#  CACHED DATA FUNCTIONS
+# ======================================================
+@st.cache_data(show_spinner=False)
+def load_excel(file):
+    return pd.read_excel(file)
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
+    dfc = df.copy()
+    numeric_cols = [
+        "On_Hand_Qty",
+        "Min_Stock",
+        "Max_Stock",
+        "Coverage_Days",
+        "forecast_3M",
+        "forecast_6M",
+        "forecast_12M",
+    ]
+    for col in numeric_cols:
+        if col in dfc.columns:
+            dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
+    return dfc
+
+
+# ======================================================
+#  LOGIN SCREEN
 # ======================================================
 def login_screen():
     st.title("🔐 Inventory Forecast App")
 
-    tab_login, tab_forgot = st.tabs(["Login", "Forgot Password"])
+    tab_login = st.tabs(["Login"])[0]
 
-    # ---------------- LOGIN TAB ----------------
     with tab_login:
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        login_btn = st.button("Login")
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            login_btn = st.button("Login")
+
+        with col2:
+            st.markdown("#### Default Admin (first time)")
+            st.code("Username: admin\nPassword: Pratik@123")
 
         if login_btn:
             user = get_user_by_username(username)
             if not user:
                 st.error("Invalid username or password")
+                return
+
+            if not user["is_active"]:
+                st.error("Your account is deactivated. Please contact the admin.")
                 return
 
             stored_hash = user["password_hash"]
@@ -314,92 +290,78 @@ def login_screen():
                 st.session_state.logged_in = True
                 st.session_state.username = user["username"]
                 st.session_state.role = user["role"]
-                st.success(f"Welcome, {user['username']}!")
-                st.rerun()
+                st.success(f"Welcome, {user['username']} ({user['role'].title()})!")
+                st.experimental_rerun()
             else:
                 st.error("Invalid username or password")
 
-    # ---------------- FORGOT PASSWORD TAB ----------------
-    with tab_forgot:
-        st.write("Enter your registered email to receive an OTP.")
 
-        email_input = st.text_input("Registered Email")
-        send_otp_btn = st.button("Send OTP")
+# ======================================================
+#  ADMIN PANEL
+# ======================================================
+def admin_panel():
+    require_login()
+    if not is_admin():
+        st.error("Only admin users can access this page.")
+        return
 
-        if send_otp_btn:
-            # find user
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE email = ?", (email_input,))
-            row = cur.fetchone()
-            conn.close()
+    st.header("🧑‍💼 Admin Panel – User Management")
 
-            if not row:
-                st.error("No user found with this email.")
-                return
+    st.subheader("Existing Users")
+    users = get_all_users()
+    if users:
+        user_rows = []
+        for u in users:
+            user_rows.append(
+                {
+                    "ID": u["id"],
+                    "Username": u["username"],
+                    "Email": u["email"],
+                    "Role": u["role"],
+                    "Active": bool(u["is_active"]),
+                    "Created At (UTC)": u["created_at"],
+                }
+            )
+        st.dataframe(pd.DataFrame(user_rows), use_container_width=True)
+    else:
+        st.info("No users found.")
 
-            otp = generate_otp()
+    st.markdown("---")
+    st.subheader("Create New User")
 
-            body = f"""
-Your password reset OTP is: {otp}
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        new_username = st.text_input("New Username")
+        new_email = st.text_input("Email (optional)")
+    with col2:
+        new_password = st.text_input("Password", type="password")
+        new_role = st.selectbox("Role", ["viewer", "admin"])
+    with col3:
+        if st.button("Create User"):
+            ok, msg = create_user(new_username, new_email, new_password, new_role)
+            if ok:
+                st.success(msg)
+                st.experimental_rerun()
+            else:
+                st.error(msg)
 
-Valid for 10 minutes.
-If you did not request this, ignore this email.
-"""
+    st.markdown("---")
+    st.subheader("Activate / Deactivate User")
 
-            sent = send_email(email_input, "Your Password Reset OTP", body)
-
-            if sent:
-                st.success("OTP sent to your email.")
-                # Store OTP in session for next step
-                st.session_state.reset_email = email_input
-                st.session_state.reset_otp = otp
-        # ---------- Step 2: Verify OTP & Set New Password ----------
-        if st.session_state.get("reset_email") and st.session_state.get("reset_otp"):
-            st.markdown("---")
-            st.markdown("### Set New Password")
-
-            otp_input = st.text_input("Enter OTP received in email", key="reset_otp_input")
-            new_pass = st.text_input("New Password", type="password", key="reset_new_pass")
-            confirm_pass = st.text_input("Confirm New Password", type="password", key="reset_confirm_pass")
-            reset_btn = st.button("Reset Password")
-
-            if reset_btn:
-                if not otp_input or not new_pass or not confirm_pass:
-                    st.error("Please fill all fields.")
-                elif new_pass != confirm_pass:
-                    st.error("New password and confirm password do not match.")
-                elif otp_input != st.session_state.get("reset_otp"):
-                    st.error("Invalid OTP.")
-                else:
-                    # Update password in database for this email
-                    email = st.session_state.get("reset_email")
-                    conn = get_connection()
-                    cur = conn.cursor()
-                    new_hash = bcrypt.hashpw(new_pass.encode("utf-8"), bcrypt.gensalt())
-                    cur.execute(
-                        "UPDATE users SET password_hash = ? WHERE email = ?",
-                        (new_hash, email),
-                    )
-                    conn.commit()
-                    conn.close()
-
-                    # Clear reset data from session
-                    st.session_state.reset_email = None
-                    st.session_state.reset_otp = None
-
-                    st.success("Password reset successfully. You can now log in with your new password.")
-
-def logout():
-    st.session_state.logged_in = False
-    st.session_state.username = None
-    st.session_state.role = None
-    st.success("You have been logged out.")
-    st.rerun()
+    if users:
+        user_dict = {f"{u['username']} (ID {u['id']})": u for u in users}
+        selected_label = st.selectbox("Select User", list(user_dict.keys()))
+        selected_user = user_dict[selected_label]
+        active_flag = bool(selected_user["is_active"])
+        desired_state = st.checkbox("Active", value=active_flag)
+        if st.button("Update Status"):
+            set_user_active(selected_user["id"], desired_state)
+            st.success("User status updated.")
+            st.experimental_rerun()
 
 
 # ======================================================
-# DASHBOARD – INVENTORY & FORECAST (FILE UPLOAD)
+#  MAIN DASHBOARD
 # ======================================================
 def run_inventory_forecast_app():
     require_login()
@@ -408,22 +370,21 @@ def run_inventory_forecast_app():
 
     st.info(
         "Step 1: Upload your latest planning Excel file "
-        "(Final_Planning_With_Forecast_And_Vendor.xlsx or similar)."
+        "(Final_Planning_With_Forecast_And_Vendor.xlsx or similar). "
+        "If you do not upload, the app will use the last saved file."
     )
 
     uploaded_file = st.file_uploader(
         "Upload planning file (Excel)",
         type=["xlsx"],
-        help="Upload your final planning master file."
+        help="Upload your final planning master file.",
     )
 
     source = None  # "upload" or "db"
 
     if uploaded_file is not None:
-        # User has uploaded a new file in this session
         source = "upload"
     else:
-        # Try to fetch the latest saved file from the database
         latest = get_latest_planning_file()
         if latest is not None:
             filename, file_bytes, uploaded_at = latest
@@ -432,7 +393,7 @@ def run_inventory_forecast_app():
                 f"(uploaded at {uploaded_at} UTC). Upload a new file to override."
             )
             buffer = io.BytesIO(file_bytes)
-            buffer.name = filename  # so pandas & our code see a name
+            buffer.name = filename
             uploaded_file = buffer
             source = "db"
         else:
@@ -447,7 +408,7 @@ def run_inventory_forecast_app():
         st.error(f"Error reading Excel file: {e}")
         st.stop()
 
-    # -------- Save file to database only when it is a new upload --------
+    # -------- Save file only when new upload --------
     if source == "upload":
         try:
             save_planning_file(uploaded_file.name, uploaded_file.getvalue())
@@ -455,28 +416,18 @@ def run_inventory_forecast_app():
         except Exception as e:
             st.warning(f"Could not save file in database: {e}")
 
-    
-    # Save raw uploaded file into database (permanent storage)
-    try:
-        save_planning_file(uploaded_file.name, uploaded_file.getvalue())
-        st.info("📦 This planning file has been saved in the database.")
-    except Exception as e:
-        st.warning(f"Could not save file in database: {e}")
-
     st.success(f"File loaded: {uploaded_file.name}")
-    st.write(f"Rows: **{df.shape[0]}**, Columns: **{df.shape[1]}**")
+    st.write(f"Rows: **{df.shape[0]:,}**, Columns: **{df.shape[1]:,}**")
 
-    # Quick preview
     with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
         st.dataframe(df.head(10), use_container_width=True)
 
-    # =====================================================
-    #  STOCK STATUS & RISK METRICS
-    # =====================================================
+    # --------------------------------------------------
+    #  INVENTORY RISK OVERVIEW
+    # --------------------------------------------------
     st.markdown("---")
     st.subheader("📦 Inventory Risk Overview")
 
-    # Total SKUs
     if "Item Name" in df.columns:
         total_skus = df["Item Name"].nunique()
     else:
@@ -497,8 +448,6 @@ def run_inventory_forecast_app():
             .reset_index(name="Count")
             .set_index("Status")
         )
-    else:
-        st.warning("Column 'Stock_Status' not found. Risk breakdown will be limited.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total SKUs", f"{total_skus:,}")
@@ -510,9 +459,9 @@ def run_inventory_forecast_app():
     if status_chart_df is not None:
         st.bar_chart(status_chart_df)
 
-    # =====================================================
+    # --------------------------------------------------
     #  COVERAGE & STOCK LEVEL INSIGHTS
-    # =====================================================
+    # --------------------------------------------------
     st.markdown("---")
     st.subheader("⏱ Coverage & Stock Level Insights")
 
@@ -529,7 +478,7 @@ def run_inventory_forecast_app():
             cov_bins = pd.cut(
                 cov,
                 bins=[0, 30, 60, 90, 180, 365, cov.max()],
-                labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"]
+                labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"],
             )
             cov_counts = (
                 cov_bins.value_counts()
@@ -544,9 +493,9 @@ def run_inventory_forecast_app():
     else:
         st.info("No 'Coverage_Days' column found – skipping coverage analysis.")
 
-    # =====================================================
+    # --------------------------------------------------
     #  DETAILED TABLES BY STATUS
-    # =====================================================
+    # --------------------------------------------------
     st.markdown("---")
     st.subheader("📃 Item-Level Details by Risk Category")
 
@@ -576,9 +525,9 @@ def run_inventory_forecast_app():
     else:
         st.dataframe(df, use_container_width=True)
 
-    # =====================================================
-    #  FORECAST OVERVIEW (3M / 6M / 12M)
-    # =====================================================
+    # --------------------------------------------------
+    #  FORECAST OVERVIEW
+    # --------------------------------------------------
     st.markdown("---")
     st.subheader("📈 Forecast Overview")
 
@@ -610,9 +559,7 @@ def run_inventory_forecast_app():
         )
         st.bar_chart(agg_forecast_df)
 
-        # -------------------------------------------------
-        #  ITEM-WISE FORECAST EXPLORER
-        # -------------------------------------------------
+        # Item-wise Forecast Explorer
         st.markdown("### 🔍 Item-wise Forecast Explorer")
 
         if "Item Name" in fdf.columns:
@@ -679,9 +626,9 @@ def run_inventory_forecast_app():
         else:
             st.info("Column 'Item Name' not found, cannot build item-wise explorer.")
 
-    # =====================================================
-    #  🤖 Item Insights (Local – Instant) + Reorder Calculator
-    # =====================================================
+    # --------------------------------------------------
+    #  ITEM INSIGHTS + REORDER CALCULATOR
+    # --------------------------------------------------
     st.markdown("---")
     st.subheader("🤖 Item Insights (Local – Instant) + Reorder Suggestion")
 
@@ -699,7 +646,6 @@ def run_inventory_forecast_app():
     item_row = df[df["Item Name"] == selected_item_ai].iloc[0]
     item_data = item_row.to_dict()
 
-    # Extract fields safely
     name = item_data.get("Item Name", "N/A")
     desc = item_data.get("Item Description", "N/A")
     status = str(item_data.get("Stock_Status", "N/A"))
@@ -719,7 +665,7 @@ def run_inventory_forecast_app():
     v_rel = item_data.get("Rec_Vendor_Reliability_Score", None)
     v_comp = item_data.get("Rec_Vendor_Composite_Score", None)
 
-    # ---- 1. Stock health text ----
+    # Stock health
     stock_summary = []
     if on_hand is not None and min_stock is not None and max_stock is not None:
         try:
@@ -741,7 +687,7 @@ def run_inventory_forecast_app():
     elif "no-rop" in status.lower():
         stock_summary.append("ℹ Stock_Status is **No-ROP-Model** – reorder policy not defined, review settings.")
 
-    # ---- 2. Coverage interpretation ----
+    # Coverage
     coverage_text = []
     try:
         if cov_days is not None:
@@ -756,22 +702,21 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # ---- 3. Forecast trend ----
+    # Forecast trend
     forecast_text = []
     try:
         if f3 is not None and f6 is not None and f12 is not None:
             if f12 > f6 > f3:
-                forecast_text.append("📈 Demand forecast is **accelerating** (3M < 6M < 12M). Future demand increasing.")
+                forecast_text.append("📈 Demand forecast is **accelerating** (3M < 6M < 12M).")
             elif f12 < f6 < f3:
-                forecast_text.append("📉 Demand forecast is **declining** (3M > 6M > 12M). Demand is slowing down.")
+                forecast_text.append("📉 Demand forecast is **declining** (3M > 6M > 12M).")
             else:
-                forecast_text.append("➖ Demand forecast is **mixed/flat** – no clear up or down trend.")
+                forecast_text.append("➖ Demand forecast is **mixed/flat** – no clear trend.")
     except Exception:
         pass
 
-    # ---- 4. Vendor assessment ----
-    vendor_text = []
-    vendor_text.append(f"Primary recommended vendor: **{vendor}**.")
+    # Vendor assessment
+    vendor_text = [f"Primary recommended vendor: **{vendor}**."]
     try:
         if v_ontime is not None:
             if v_ontime >= 95:
@@ -782,10 +727,7 @@ def run_inventory_forecast_app():
                 vendor_text.append(f"🟠 On-time performance is **{v_ontime:.1f}%** – moderate, monitor closely.")
             else:
                 vendor_text.append(f"🔴 On-time performance is **{v_ontime:.1f}%** – weak, high delay risk.")
-    except Exception:
-        pass
 
-    try:
         if v_rel is not None:
             vendor_text.append(f"Vendor reliability score: **{v_rel}**.")
         if v_comp is not None:
@@ -797,27 +739,31 @@ def run_inventory_forecast_app():
     except Exception:
         pass
 
-    # ---- 5. Action recommendation (qualitative) ----
+    # Qualitative action
     recommendation_lines = []
     try:
-        if status.lower().startswith("shortage") or (on_hand is not None and min_stock is not None and on_hand < min_stock):
+        if status.lower().startswith("shortage") or (
+            on_hand is not None and min_stock is not None and on_hand < min_stock
+        ):
             recommendation_lines.append("✅ **Action:** Consider placing/releasing a PO immediately for this item.")
-        elif status.lower().startswith("excess") or (on_hand is not None and max_stock is not None and on_hand > max_stock):
-            recommendation_lines.append("✅ **Action:** Slow down or pause new orders, and review consumption plan.")
+        elif status.lower().startswith("excess") or (
+            on_hand is not None and max_stock is not None and on_hand > max_stock
+        ):
+            recommendation_lines.append(
+                "✅ **Action:** Slow down or pause new orders, and review consumption plan."
+            )
         elif status.lower() == "ok":
-            recommendation_lines.append("✅ **Action:** No urgent action; continue monitoring based on coverage and forecast.")
+            recommendation_lines.append(
+                "✅ **Action:** No urgent action; continue monitoring based on coverage and forecast."
+            )
         else:
-            recommendation_lines.append("ℹ **Action:** Review item parameters (Min/Max, forecast, vendor) before deciding.")
+            recommendation_lines.append(
+                "ℹ **Action:** Review item parameters (Min/Max, forecast, vendor) before deciding."
+            )
     except Exception:
         pass
 
-    # ---- 6. Reorder quantity calculator (simple ROP model) ----
-    # Logic:
-    #  - Monthly demand ≈ forecast_12M / 12 (fallback to 6M / 3M if needed)
-    #  - Lead time in months = Rec_Vendor_LeadTime_Days / 30 (fallback 30 days)
-    #  - Reorder point = monthly_demand * lead_time_months + safety_stock (Min_Stock)
-    #  - Target level = Max_Stock (if available) else 1.5 * reorder_point
-    #  - Recommended order = max(0, target_level - On_Hand_Qty)
+    # Reorder calculator
     monthly_demand = None
     try:
         if f12 is not None and f12 > 0:
@@ -837,10 +783,7 @@ def run_inventory_forecast_app():
     except Exception:
         lead_time_months = None
 
-    reorder_point = None
-    target_level = None
-    recommended_order = None
-
+    reorder_point = target_level = recommended_order = None
     if monthly_demand is not None and lead_time_months is not None and on_hand is not None:
         safety_stock = min_stock if min_stock is not None else 0
         try:
@@ -852,34 +795,20 @@ def run_inventory_forecast_app():
 
             recommended_order = max(0, target_level - on_hand)
         except Exception:
-            reorder_point = None
-            target_level = None
-            recommended_order = None
+            reorder_point = target_level = recommended_order = None
 
-    # ---- Display nicely ----
+    # Display
     st.markdown(f"### 🧾 Summary for: **{name}**")
     st.markdown(f"**Description:** {desc}")
 
     st.markdown("#### 1. Stock Health")
-    if stock_summary:
-        for line in stock_summary:
-            st.write(line)
-    else:
-        st.write("No stock health information available.")
+    st.write("\n".join(stock_summary) if stock_summary else "No stock health information available.")
 
     st.markdown("#### 2. Coverage Analysis")
-    if coverage_text:
-        for line in coverage_text:
-            st.write(line)
-    else:
-        st.write("Coverage information not available.")
+    st.write("\n".join(coverage_text) if coverage_text else "Coverage information not available.")
 
     st.markdown("#### 3. Forecast Behaviour")
-    if forecast_text:
-        for line in forecast_text:
-            st.write(line)
-    else:
-        st.write("Forecast information not sufficient to derive a trend.")
+    st.write("\n".join(forecast_text) if forecast_text else "Forecast information not sufficient.")
 
     st.markdown("#### 4. Vendor Assessment")
     for line in vendor_text:
@@ -889,9 +818,7 @@ def run_inventory_forecast_app():
     for line in recommendation_lines:
         st.write(line)
 
-    # ---- 7. Reorder quantity output ----
     st.markdown("#### 6. Reorder Quantity Suggestion")
-
     if recommended_order is not None and reorder_point is not None and target_level is not None:
         colR1, colR2, colR3, colR4 = st.columns(4)
         colR1.metric("On Hand Qty", f"{on_hand:.0f}" if on_hand is not None else "N/A")
@@ -904,502 +831,15 @@ def run_inventory_forecast_app():
         else:
             st.write("🟢 Suggested action: **No immediate PO** required based on current stock vs target.")
     else:
-        st.write("ℹ Not enough data to compute a reliable reorder quantity (missing forecast, lead time, or stock values).")
-
-
-    # Convert row to dictionary for easier use
-    item_data = item_row.to_dict()
-
-    # AI prompt construction
-    ai_prompt = f"""
-    You are an expert Supply Chain planner. Analyze the following item data and produce a clear, practical insight summary.
-    
-    Item Name: {item_data.get('Item Name')}
-    Description: {item_data.get('Item Description')}
-    Stock Status: {item_data.get('Stock_Status')}
-    On Hand Qty: {item_data.get('On_Hand_Qty')}
-    Min Stock: {item_data.get('Min_Stock')}
-    Max Stock: {item_data.get('Max_Stock')}
-    Coverage Days: {item_data.get('Coverage_Days')}
-
-    forecast_3M: {item_data.get('forecast_3M')}
-    forecast_6M: {item_data.get('forecast_6M')}
-    forecast_12M: {item_data.get('forecast_12M')}
-
-    Recommended Vendor: {item_data.get('Rec_Vendor_Name')}
-    Vendor Price (USD): {item_data.get('Rec_Vendor_Price_USD')}
-    Vendor Lead Time (Days): {item_data.get('Rec_Vendor_LeadTime_Days')}
-    Vendor On-Time %: {item_data.get('Rec_Vendor_OnTime_Percent')}
-    Vendor Reliability Score: {item_data.get('Rec_Vendor_Reliability_Score')}
-    Vendor Composite Score: {item_data.get('Rec_Vendor_Composite_Score')}
-
-    Provide a structured analysis with:
-    1. Summary of current stock health
-    2. Whether stockout or excess is likely
-    3. Forecast trend interpretation (3M vs 6M vs 12M)
-    4. Vendor recommendation & reliability assessment
-    5. Risk factors to monitor
-    6. Final actionable recommendation (Buy / Hold / Expedite / Monitor)
-    """
-
-    if st.button("Generate AI Insight"):
-        with st.spinner("Thinking…"):
-            from openai import OpenAI
-            client = OpenAI()
-
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a supply chain expert."},
-                    {"role": "user", "content": ai_prompt},
-                ],
-                max_tokens=400,
-            )
-
-            ai_result = response.choices[0].message["content"]
-            st.markdown("### 🧠 AI Insight Result")
-            st.write(ai_result)
-
-    # =====================================================
-    #  EXACT STOCKOUT / OVERSTOCK LOGIC USING YOUR COLUMNS
-    # =====================================================
-    # Total SKUs
-    total_skus = df["Item Name"].nunique() if "Item Name" in df.columns else df.shape[0]
-
-    # Use your existing Stock_Status values:
-    #   Shortage_Risk, Excess_Risk, OK, No-ROP-Model
-    if "Stock_Status" not in df.columns:
-        st.error("Column 'Stock_Status' not found in file.")
-        st.stop()
-
-    status_counts = df["Stock_Status"].value_counts()
-
-    shortage = int(status_counts.get("Shortage_Risk", 0))
-    excess = int(status_counts.get("Excess_Risk", 0))
-    healthy = int(status_counts.get("OK", 0))
-    no_model = int(status_counts.get("No-ROP-Model", 0))
-
-    # Top metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total SKUs", f"{total_skus:,}")
-    c2.metric("Shortage Risk", f"{shortage:,}")
-    c3.metric("Excess Risk", f"{excess:,}")
-    c4.metric("Healthy (OK)", f"{healthy:,}")
-    c5.metric("No ROP Model", f"{no_model:,}")
-
-    st.markdown("---")
-    st.subheader("📦 Inventory Risk Overview")
-
-    # Status bar chart
-    status_chart_df = (
-        status_counts.rename_axis("Status")
-        .reset_index(name="Count")
-        .set_index("Status")
-    )
-    st.bar_chart(status_chart_df)
-
-    # =====================================================
-    #  COVERAGE & STOCK LEVEL INSIGHTS (USING YOUR COLUMNS)
-    # =====================================================
-    st.markdown("---")
-    st.subheader("⏱ Coverage & Stock Level Insights")
-
-    if "Coverage_Days" in df.columns:
-        cov = df["Coverage_Days"].dropna()
-        if not cov.empty:
-            colA, colB, colC, colD = st.columns(4)
-            colA.metric("Avg Coverage (days)", f"{cov.mean():.1f}")
-            colB.metric("Median Coverage (days)", f"{cov.median():.1f}")
-            colC.metric("P10 (Low)", f"{cov.quantile(0.10):.0f}")
-            colD.metric("P90 (High)", f"{cov.quantile(0.90):.0f}")
-
-            # Simple coverage distribution chart
-            st.write("Coverage days distribution (bucketed):")
-            cov_bins = pd.cut(
-                cov,
-                bins=[0, 30, 60, 90, 180, 365, cov.max()],
-                labels=["0–30", "31–60", "61–90", "91–180", "181–365", "365+"]
-            )
-            cov_counts = (
-                cov_bins.value_counts()
-                .sort_index()
-                .rename_axis("Coverage_Bucket")
-                .reset_index(name="Count")
-                .set_index("Coverage_Bucket")
-            )
-            st.bar_chart(cov_counts)
-        else:
-            st.info("Coverage_Days column is present but contains no numeric data.")
-    else:
-        st.info("No 'Coverage_Days' column found – skipping coverage analysis.")
-
-    # =====================================================
-    #  DETAILED TABLES BY STATUS
-    # =====================================================
-    st.markdown("---")
-    st.subheader("📃 Item-Level Details by Risk Category")
-
-    tab_all, tab_short, tab_excess, tab_ok, tab_nomodel = st.tabs(
-        ["All Items", "Shortage Risk", "Excess Risk", "OK", "No-ROP-Model"]
-    )
-
-    with tab_all:
-        st.dataframe(df, use_container_width=True)
-
-    with tab_short:
-        st.write(f"Total Shortage_Risk items: **{shortage:,}**")
-        st.dataframe(df[df["Stock_Status"] == "Shortage_Risk"], use_container_width=True)
-
-    with tab_excess:
-        st.write(f"Total Excess_Risk items: **{excess:,}**")
-        st.dataframe(df[df["Stock_Status"] == "Excess_Risk"], use_container_width=True)
-
-    with tab_ok:
-        st.write(f"Total OK items: **{healthy:,}**")
-        st.dataframe(df[df["Stock_Status"] == "OK"], use_container_width=True)
-
-    with tab_nomodel:
-        st.write(f"Total No-ROP-Model items: **{no_model:,}**")
-        st.dataframe(df[df["Stock_Status"] == "No-ROP-Model"], use_container_width=True)
-
-    # =====================================================
-    #  📈 FORECAST OVERVIEW USING forecast_3M / 6M / 12M
-    # =====================================================
-    st.markdown("---")
-    st.subheader("📈 Forecast Overview")
-
-    forecast_cols = ["forecast_3M", "forecast_6M", "forecast_12M"]
-    missing_forecast = [c for c in forecast_cols if c not in df.columns]
-
-    if missing_forecast:
-        st.info(
-            f"Forecast columns missing: {', '.join(missing_forecast)}. "
-            "Skipping forecast charts."
+        st.write(
+            "ℹ Not enough data to compute a reliable reorder quantity "
+            "(missing forecast, lead time, or stock values)."
         )
-        return
-
-    # Ensure numeric
-    fdf = df.copy()
-    for c in forecast_cols:
-        fdf[c] = pd.to_numeric(fdf[c], errors="coerce")
-
-    totals = fdf[forecast_cols].sum()
-
-    colF1, colF2, colF3, colF4 = st.columns(4)
-    colF1.metric("Total Forecast 3M", f"{totals['forecast_3M']:.0f}")
-    colF2.metric("Total Forecast 6M", f"{totals['forecast_6M']:.0f}")
-    colF3.metric("Total Forecast 12M", f"{totals['forecast_12M']:.0f}")
-    colF4.metric("Avg Monthly Forecast (12M)", f"{(totals['forecast_12M'] / 12):.0f}")
-
-    # Simple aggregate chart: horizon vs total forecast
-    agg_forecast_df = (
-        totals.rename_axis("Horizon")
-        .reset_index(name="Quantity")
-        .set_index("Horizon")
-    )
-    st.bar_chart(agg_forecast_df)
-
-    # =====================================================
-    #  🔍 ITEM-WISE FORECAST EXPLORER
-    # =====================================================
-    st.markdown("### 🔍 Item-wise Forecast Explorer")
-
-    if "Item Name" in fdf.columns:
-        # Limit to items with some forecast
-        fdf_nonzero = fdf[
-            (fdf["forecast_3M"] > 0)
-            | (fdf["forecast_6M"] > 0)
-            | (fdf["forecast_12M"] > 0)
-        ]
-        if fdf_nonzero.empty:
-            st.info("No items with non-zero forecast values.")
-            return
-
-        # Sort by highest 12M forecast
-        fdf_nonzero = fdf_nonzero.sort_values("forecast_12M", ascending=False)
-
-        item_list = fdf_nonzero["Item Name"].unique().tolist()
-        selected_item = st.selectbox(
-            "Select an item (sorted by highest 12M forecast)",
-            item_list,
-        )
-
-        row = fdf_nonzero[fdf_nonzero["Item Name"] == selected_item].iloc[0]
-
-        # Prepare chart data: On-hand vs forecast horizons
-        values = {}
-        if "On_Hand_Qty" in row.index:
-            values["On Hand"] = row["On_Hand_Qty"]
-        values["Forecast 3M"] = row["forecast_3M"]
-        values["Forecast 6M"] = row["forecast_6M"]
-        values["Forecast 12M"] = row["forecast_12M"]
-
-        item_chart_df = (
-            pd.Series(values)
-            .rename_axis("Horizon")
-            .reset_index(name="Quantity")
-            .set_index("Horizon")
-        )
-
-        st.write(f"**Item:** {selected_item}")
-        st.bar_chart(item_chart_df)
-
-        # Show key fields for this item
-        info_cols = [
-            "Item Name",
-            "Item Description",
-            "On_Hand_Qty",
-            "Min_Stock",
-            "Max_Stock",
-            "Coverage_Days",
-            "Stock_Status",
-            "forecast_3M",
-            "forecast_6M",
-            "forecast_12M",
-            "Rec_Vendor_Name",
-            "Rec_Vendor_Price_USD",
-            "Rec_Vendor_LeadTime_Days",
-            "Rec_Vendor_OnTime_Percent",
-            "Rec_Vendor_Reliability_Score",
-            "Rec_Vendor_Composite_Score",
-        ]
-        info_cols = [c for c in info_cols if c in row.index]
-
-        st.write("**Item details:**")
-        st.dataframe(
-            pd.DataFrame(row[info_cols]).T,
-            use_container_width=True,
-        )
-    else:
-        st.info("Column 'Item Name' not found, cannot build item-wise explorer.")
-
-    # =====================================================
-    #  DETAILED TABLES BY STATUS
-    # =====================================================
-    st.markdown("---")
-    st.subheader("📃 Item-Level Details by Risk Category")
-
-    tab_all, tab_short, tab_excess, tab_ok, tab_nomodel = st.tabs(
-        ["All Items", "Shortage Risk", "Excess Risk", "OK", "No-ROP-Model"]
-    )
-
-    with tab_all:
-        st.dataframe(df, use_container_width=True)
-
-    with tab_short:
-        st.write(f"Total Shortage_Risk items: **{shortage:,}**")
-        st.dataframe(df[df["Stock_Status"] == "Shortage_Risk"], use_container_width=True)
-
-    with tab_excess:
-        st.write(f"Total Excess_Risk items: **{excess:,}**")
-        st.dataframe(df[df["Stock_Status"] == "Excess_Risk"], use_container_width=True)
-
-    with tab_ok:
-        st.write(f"Total OK items: **{healthy:,}**")
-        st.dataframe(df[df["Stock_Status"] == "OK"], use_container_width=True)
-
-    with tab_nomodel:
-        st.write(f"Total No-ROP-Model items: **{no_model:,}**")
-        st.dataframe(df[df["Stock_Status"] == "No-ROP-Model"], use_container_width=True)
-
-
-    # =====================================================
-    #  CONFIGURE STOCKOUT / OVERSTOCK LOGIC FROM COLUMNS
-    # =====================================================
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
-    if len(numeric_cols) < 1:
-        st.error("No numeric columns found. Cannot compute stockout/overstock.")
-        st.stop()
-
-    def guess_index(keywords):
-        for i, c in enumerate(numeric_cols):
-            cl = c.lower()
-            if any(k in cl for k in keywords):
-                return i
-        return 0
-
-    st.markdown("### ⚙ Stock Logic Configuration")
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        idx_current = guess_index(["current", "stock", "qty", "quantity"])
-        current_col = st.selectbox(
-            "Select **Current Stock** column",
-            numeric_cols,
-            index=idx_current,
-        )
-    with col_b:
-        idx_min = guess_index(["min", "safety", "reorder"])
-        min_col = st.selectbox(
-            "Select **Min Level / Safety Stock** column",
-            numeric_cols,
-            index=idx_min,
-        )
-    with col_c:
-        idx_max = guess_index(["max", "target", "upper"])
-        max_col = st.selectbox(
-            "Select **Max Level** column",
-            numeric_cols,
-            index=idx_max,
-        )
-
-    # -------- Compute stock status --------
-    df = df.copy()
-    df["Stock_Status"] = "OK"
-    df.loc[df[current_col] < df[min_col], "Stock_Status"] = "Stockout"
-    df.loc[df[current_col] > df[max_col], "Stock_Status"] = "Overstock"
-
-    stockout_items = (df["Stock_Status"] == "Stockout").sum()
-    overstock_items = (df["Stock_Status"] == "Overstock").sum()
-    healthy_items = (df["Stock_Status"] == "OK").sum()
-
-    # -------- Total SKUs (by item identifier if present) --------
-    total_skus = df.shape[0]
-    if "Item Name" in df.columns:
-        total_skus = df["Item Name"].nunique()
-    elif "ITEM_NUMBER" in df.columns:
-        total_skus = df["ITEM_NUMBER"].nunique()
-    elif "Item Code" in df.columns:
-        total_skus = df["Item Code"].nunique()
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total SKUs", f"{total_skus:,}")
-    col2.metric("Stockout Items", f"{stockout_items:,}")
-    col3.metric("Overstock Items", f"{overstock_items:,}")
-    col4.metric("Healthy Items", f"{healthy_items:,}")
-
-    # -------- Status chart --------
-    st.markdown("---")
-    st.subheader("Inventory Status Summary")
-
-    status_df = (
-        df["Stock_Status"]
-        .value_counts()
-        .reindex(["Stockout", "OK", "Overstock"])
-        .fillna(0)
-        .astype(int)
-        .rename_axis("Status")
-        .reset_index(name="Count")
-    )
-    status_df = status_df.set_index("Status")
-    st.bar_chart(status_df)
-
-    # -------- Detailed tables in tabs --------
-    st.markdown("---")
-    st.subheader("Item-Level Details")
-    tab_all, tab_stockout, tab_over = st.tabs(
-        ["All Items", "Stockout Items", "Overstock Items"]
-    )
-
-    with tab_all:
-        st.dataframe(df, use_container_width=True)
-
-    with tab_stockout:
-        st.write(f"Total stockout items: **{stockout_items}**")
-        st.dataframe(df[df["Stock_Status"] == "Stockout"], use_container_width=True)
-
-    with tab_over:
-        st.write(f"Total overstock items: **{overstock_items}**")
-        st.dataframe(df[df["Stock_Status"] == "Overstock"], use_container_width=True)
 
 
 # ======================================================
-# ADMIN PANEL – MANAGE USERS
+#  LOCAL AI CHAT ASSISTANT
 # ======================================================
-def admin_panel():
-    require_login()
-    if not is_admin():
-        st.error("You are not authorized to view this page.")
-        st.stop()
-
-    st.subheader("🛠 Admin Panel – User Management")
-
-    st.write(
-        f"Logged in as: **{st.session_state.username}** "
-        f"(Role: **{st.session_state.role}**)"
-    )
-
-    # ----- Add New User -----
-    st.markdown("### ➕ Add New User")
-    with st.form("add_user_form"):
-        new_username = st.text_input("Username")
-        new_email = st.text_input("Email")
-        new_password = st.text_input("Password", type="password")
-        new_role = st.selectbox("Role", ["viewer", "admin"])
-        submitted = st.form_submit_button("Create User")
-
-    if submitted:
-        if not new_username or not new_password:
-            st.error("Username and Password are required.")
-        else:
-            ok, msg = create_user(new_username, new_email, new_password, new_role)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-
-    st.markdown("---")
-
-    # ----- Existing Users -----
-    st.markdown("### 👥 Existing Users")
-    users = list_users()
-    if not users:
-        st.info("No users found.")
-    else:
-        for u in users:
-            cols = st.columns([2, 2, 2, 1, 2])
-            with cols[0]:
-                st.write(f"**{u['username']}**")
-            with cols[1]:
-                st.write(u["email"] or "—")
-            with cols[2]:
-                st.write(f"Role: `{u['role']}`")
-            with cols[3]:
-                active_label = "Active" if u["is_active"] else "Inactive"
-                st.write(active_label)
-            with cols[4]:
-                st.write(f"Created: {u['created_at'][:19]}")
-
-    st.markdown("---")
-
-    # ----- Activate / Deactivate User -----
-    st.markdown("### ✅ Activate / Deactivate User")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        tgt_user = st.text_input("Username to activate/deactivate")
-    with col_b:
-        active_choice = st.selectbox("Set status to", ["Active", "Inactive"])
-    if st.button("Update Status"):
-        if not tgt_user:
-            st.error("Please enter a username.")
-        else:
-            set_user_active(tgt_user, active_choice == "Active")
-            st.success(f"Status for '{tgt_user}' set to {active_choice}.")
-            st.rerun()
-
-    # ----- Delete User -----
-    st.markdown("### 🗑 Delete User")
-    del_user = st.text_input("Username to delete (cannot delete 'admin')")
-    if st.button("Delete User"):
-        if not del_user:
-            st.error("Please enter a username.")
-        else:
-            ok, msg = delete_user(del_user)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-
-    st.info(
-        "Next steps (future upgrades):\n"
-        "- Password reset via email / OTP\n"
-        "- Detailed audit logs and login history\n"
-        "- Per-page permissions"
-    )
-
 def ai_chat_page():
     """Local, fast AI-style assistant (no external API)."""
     require_login()
@@ -1424,116 +864,101 @@ def ai_chat_page():
         q_low = q.lower()
         answers = []
 
-        # --- Stockout / shortage questions ---
+        # Stockout / shortage
         if "stockout" in q_low or "stock out" in q_low or "shortage" in q_low:
             answers.append(
                 "### 🔴 Handling Stockouts / Shortage Risk\n"
                 "- Identify SKUs with `Stock_Status = Shortage_Risk` and very low `Coverage_Days` (e.g. < 15 days).\n"
                 "- Check `On_Hand_Qty` vs `Min_Stock`. If On Hand < Min Stock, plan an urgent PO.\n"
-                "- Use recommended vendor fields: `Rec_Vendor_Name`, `Rec_Vendor_LeadTime_Days`, "
-                "`Rec_Vendor_OnTime_Percent` to choose the fastest and most reliable vendor.\n"
-                "- If lead time is long, consider partial shipment or alternate vendor to reduce risk.\n"
-                "- Communicate risk items to production and planning so they can adjust schedules."
+                "- Use recommended vendor fields and lead time to pick fastest reliable vendor.\n"
+                "- For long lead-time items, consider safety stock increase and alternate vendors.\n"
+                "- Communicate risk items to production so they can adjust schedules."
             )
 
-        # --- Excess / overstock questions ---
+        # Excess / overstock
         if "overstock" in q_low or "excess" in q_low or "slow moving" in q_low:
             answers.append(
                 "### 🟠 Handling Excess / Overstock\n"
                 "- Filter items with `Stock_Status = Excess_Risk` and very high `Coverage_Days` (e.g. > 180 days).\n"
                 "- Compare `On_Hand_Qty` vs `Max_Stock`. If On Hand >> Max Stock, put the item on PO hold.\n"
-                "- Reduce or postpone new orders, especially from vendors with long lead times.\n"
-                "- Discuss consumption plan with users: can these items be substituted or used in other lines?\n"
-                "- Plan liquidation, scrap review, or alternate use for extremely high coverage items."
+                "- Reduce or postpone new orders for these items.\n"
+                "- Discuss alternate uses or substitution possibilities with users.\n"
+                "- Plan liquidation or scrap review for extreme cases."
             )
 
-        # --- Min / Max questions ---
+        # Min/Max
         if "min" in q_low and "max" in q_low:
             answers.append(
                 "### 📏 Setting Min / Max Levels\n"
-                "- Use forecast columns (`forecast_3M`, `forecast_6M`, `forecast_12M`) to estimate demand.\n"
-                "- Monthly demand ≈ `forecast_12M / 12` (or `forecast_6M / 6` if 12M is not stable).\n"
+                "- Estimate monthly demand from `forecast_12M` (or 6M/3M).\n"
                 "- Reorder point (ROP) ≈ Demand during lead time + safety stock.\n"
-                "  - Demand during lead time ≈ Monthly demand × (LeadTimeDays / 30).\n"
-                "  - Safety stock can be approximated by current `Min_Stock` or a % of average monthly demand.\n"
-                "- Set `Min_Stock` near the ROP and `Max_Stock` as 1.5–2 × Min for critical items, "
-                "lower for non-critical.\n"
-                "- Review Min/Max regularly for high-variance items with big swings in forecast."
+                "- Demand during lead time ≈ Monthly demand × (LeadTimeDays / 30).\n"
+                "- Safety stock can be based on variability or existing Min_Stock.\n"
+                "- Set Max_Stock around 1.5–2 × ROP for critical items, lower for others.\n"
+                "- Review parameters regularly for items with unstable demand."
             )
 
-        # --- Vendor performance questions ---
+        # Vendor
         if "vendor" in q_low or "supplier" in q_low:
             answers.append(
                 "### 🧑‍💼 Vendor Performance & Selection\n"
-                "- Use `Rec_Vendor_OnTime_Percent`, `Rec_Vendor_Reliability_Score`, and "
-                "`Rec_Vendor_Composite_Score` to compare vendors.\n"
-                "- For critical items, prefer vendors with On Time > 90% and high reliability scores.\n"
-                "- If price is higher but reliability is much better, highlight total cost of stockout "
-                "vs small price difference.\n"
-                "- For poor-performing vendors (low on-time, low reliability), consider:\n"
-                "  - reducing volumes,\n"
-                "  - using them only for non-critical items,\n"
-                "  - or developing alternate vendors."
+                "- Compare vendors on on-time %, reliability score, and composite score.\n"
+                "- For critical items, prefer vendors with high on-time and reliability even if slightly costlier.\n"
+                "- Use poor performers only for non-critical items or as backup.\n"
+                "- Track lead time adherence and update master data when vendor performance changes."
             )
 
-        # --- Coverage / planning questions ---
-        if "coverage" in q_low or "days" in q_low:
+        # Coverage
+        if "coverage" in q_low:
             answers.append(
                 "### ⏱ Coverage Days Interpretation\n"
-                "- `Coverage_Days` < 15: Very high risk of stockout → expedite PO or increase order quantity.\n"
-                "- 15–45 days: Moderate coverage → keep monitoring but do not over-order.\n"
-                "- 45–120 days: Healthy coverage for most items.\n"
-                "- > 120 days: Potential overstock → slow or stop new orders, check demand assumptions.\n"
-                "- Use coverage together with Stock_Status to prioritise actions."
+                "- < 15 days: Very high stockout risk → expedite PO.\n"
+                "- 15–45 days: Acceptable but monitor.\n"
+                "- 45–120 days: Healthy coverage.\n"
+                "- > 120 days: Potential overstock → slow or stop new orders and review forecast."
             )
 
-        # --- Reorder quantity / PO recommendation ---
-        if "reorder" in q_low or "po" in q_low or "purchase order" in q_low or "order quantity" in q_low:
+        # Reorder / PO
+        if "reorder" in q_low or "order quantity" in q_low or "purchase order" in q_low or "po " in q_low:
             answers.append(
                 "### 📦 Reorder Quantity & PO Recommendation\n"
-                "- Estimate monthly demand from forecast (12M or 6M horizon).\n"
-                "- Reorder point = monthly demand × (LeadTimeDays / 30) + safety stock.\n"
-                "- Target stock level can be Max_Stock, or 1.5 × ROP if Max is not defined.\n"
-                "- Recommended order ≈ max(0, TargetStock − OnHand).\n"
-                "- For very expensive or slow-moving items, reduce Max_Stock and order more frequently in smaller lots."
+                "- Monthly demand from forecast; ROP = demand during lead time + safety stock.\n"
+                "- Target stock = Max_Stock or ~1.5 × ROP.\n"
+                "- Suggested order = max(0, TargetStock − OnHand).\n"
+                "- For high-value items, reduce target and order more frequently in smaller lots."
             )
 
-        # --- Generic / fallback answer ---
+        # Fallback
         if not answers:
             answers.append(
                 "### 🧠 General Guidance\n"
-                "- Focus first on items with `Shortage_Risk` and low `Coverage_Days` – these directly affect production.\n"
-                "- Next, look at `Excess_Risk` items with very high coverage to free up working capital.\n"
-                "- Use the dashboard's Item Insights & Reorder Suggestion for item-level actions.\n"
-                "- If you describe a specific scenario with numbers (On_Hand, Min, Max, forecast, lead time), "
-                "I can give a more concrete step-by-step recommendation."
+                "- Focus first on Shortage_Risk items with low coverage; then on Excess_Risk with very high coverage.\n"
+                "- Use the dashboard Item Insights section to analyse a specific SKU.\n"
+                "- If you share concrete numbers (On_Hand, Min, Max, forecast, lead time), "
+                "you can translate them into ROP and recommended order using the same logic used in the app."
             )
 
         full_answer = "\n\n".join(answers)
-
         st.markdown("### 💬 Answer")
         st.markdown(full_answer)
-    
+
 
 # ======================================================
-# MAIN ROUTER
+#  MAIN ROUTER
 # ======================================================
 def main():
     init_user_db()
     init_planning_table()
     init_session_state()
 
-    # If not logged in, show login screen and exit
     if not st.session_state.logged_in:
         login_screen()
         return
 
-    # ---------------- Sidebar navigation ----------------
     st.sidebar.title("Navigation")
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
 
-    # Menu options
     menu = ["Dashboard", "AI Assistant"]
     if is_admin():
         menu.append("Admin Panel")
@@ -1541,37 +966,15 @@ def main():
 
     choice = st.sidebar.radio("Go to", menu)
 
-    # ---------------- Routing ----------------
     if choice == "Dashboard":
         run_inventory_forecast_app()
     elif choice == "AI Assistant":
         ai_chat_page()
     elif choice == "Admin Panel":
-        # Extra safety: only admins should see this, but check again
-        if is_admin():
-            admin_panel()
-        else:
-            st.error("You are not authorized to view this page.")
+        admin_panel()
     elif choice == "Logout":
         logout()
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
