@@ -91,20 +91,25 @@ def init_planning_table():
 
 
 def save_planning_file(filename: str, file_bytes: bytes):
-    """Save uploaded planning file into SQLite."""
+    """Save uploaded planning file into SQLite (robust, own connection)."""
     from datetime import datetime
+    import sqlite3
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO planning_files (filename, uploaded_at, file_data)
-        VALUES (?, ?, ?)
-        """,
-        (filename, datetime.utcnow().isoformat(), file_bytes),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        # Open a fresh connection just for this insert
+        with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO planning_files (filename, uploaded_at, file_data)
+                VALUES (?, ?, ?)
+                """,
+                (filename, datetime.utcnow().isoformat(), file_bytes),
+            )
+            conn.commit()
+    except Exception as e:
+        # Let caller decide how to show the message
+        raise e
 
     # Ensure default admin exists
     cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
@@ -390,7 +395,8 @@ def run_inventory_forecast_app():
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
-        # Save raw uploaded file into database (permanent storage)
+    
+    # Save raw uploaded file into database (permanent storage)
     try:
         save_planning_file(uploaded_file.name, uploaded_file.getvalue())
         st.info("📦 This planning file has been saved in the database.")
@@ -1369,6 +1375,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
