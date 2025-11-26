@@ -199,6 +199,9 @@ def init_session_state():
         st.session_state.username = None
     if "role" not in st.session_state:
         st.session_state.role = "viewer"
+    # Chat history for AI Assistant
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []  # list of dicts: {"role": "user"/"assistant", "text": "..."}
 
 
 def is_admin() -> bool:
@@ -220,15 +223,17 @@ def logout():
 
 
 # ======================================================
-#  CACHED DATA FUNCTIONS
+#  CACHED DATA FUNCTIONS – SPEED IMPROVEMENT
 # ======================================================
 @st.cache_data(show_spinner=False)
-def load_excel(file):
-    return pd.read_excel(file)
+def load_and_preprocess_excel(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Read Excel from bytes and preprocess numeric columns.
+    Cached by bytes → avoids re-reading the same file every time.
+    """
+    buffer = io.BytesIO(file_bytes)
+    df = pd.read_excel(buffer)
 
-
-@st.cache_data(show_spinner=False)
-def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     dfc = df.copy()
     numeric_cols = [
         "On_Hand_Qty",
@@ -374,9 +379,13 @@ def run_inventory_forecast_app():
     )
 
     source = None  # "upload" or "db"
+    filename = None
+    file_bytes = None
 
     if uploaded_file is not None:
         source = "upload"
+        filename = uploaded_file.name
+        file_bytes = uploaded_file.getvalue()
     else:
         latest = get_latest_planning_file()
         if latest is not None:
@@ -385,18 +394,14 @@ def run_inventory_forecast_app():
                 f"📂 Using last saved planning file: **{filename}** "
                 f"(uploaded at {uploaded_at} UTC). Upload a new file to override."
             )
-            buffer = io.BytesIO(file_bytes)
-            buffer.name = filename
-            uploaded_file = buffer
             source = "db"
         else:
             st.warning("No file uploaded and no saved file found. Please upload a planning Excel file.")
             st.stop()
 
-    # -------- Read Excel (cached) --------
+    # -------- Read Excel (cached by file_bytes) --------
     try:
-        df_raw = load_excel(uploaded_file)
-        df = preprocess_df(df_raw)
+        df = load_and_preprocess_excel(file_bytes)
     except Exception as e:
         st.error(f"Error reading Excel file: {e}")
         st.stop()
@@ -404,12 +409,12 @@ def run_inventory_forecast_app():
     # -------- Save file only when new upload --------
     if source == "upload":
         try:
-            save_planning_file(uploaded_file.name, uploaded_file.getvalue())
+            save_planning_file(filename, file_bytes)
             st.info("📦 This planning file has been saved in the database.")
         except Exception as e:
             st.warning(f"Could not save file in database: {e}")
 
-    st.success(f"File loaded: {uploaded_file.name}")
+    st.success(f"File loaded: {filename}")
     st.write(f"Rows: **{df.shape[0]:,}**, Columns: **{df.shape[1]:,}**")
 
     with st.expander("🔍 Preview data (first 10 rows)", expanded=False):
@@ -831,20 +836,31 @@ def run_inventory_forecast_app():
 
 
 # ======================================================
-#  LOCAL AI CHAT ASSISTANT
+#  LOCAL AI CHAT ASSISTANT – NOW FIRST & WITH HISTORY
 # ======================================================
 def ai_chat_page():
     """Local, fast AI-style assistant (no external API)."""
     require_login()
 
-    st.header("🤖 AI Assistant (Local)")
+    st.header("🤖 AI Assistant (Local, Rule-Based)")
 
     st.write(
-        "Ask any question related to inventory, min–max, stockouts, coverage, "
+        "Ask any question related to inventory, Min–Max, stockouts, coverage, "
         "vendor performance, or planning logic.\n\n"
         "This assistant uses rule-based logic from your supply-chain domain, "
         "so it is fast and does not require internet or API keys."
     )
+
+    # Show chat history
+    if st.session_state.chat_history:
+        st.markdown("### 💬 Conversation")
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.markdown(f"**You:** {msg['text']}")
+            else:
+                st.markdown(f"**Assistant:** {msg['text']}")
+
+        st.markdown("---")
 
     question = st.text_area("Your question", height=120, key="ai_chat_question")
 
@@ -912,7 +928,12 @@ def ai_chat_page():
             )
 
         # Reorder / PO
-        if "reorder" in q_low or "order quantity" in q_low or "purchase order" in q_low or "po " in q_low:
+        if (
+            "reorder" in q_low
+            or "order quantity" in q_low
+            or "purchase order" in q_low
+            or "po " in q_low
+        ):
             answers.append(
                 "### 📦 Reorder Quantity & PO Recommendation\n"
                 "- Monthly demand from forecast; ROP = demand during lead time + safety stock.\n"
@@ -932,6 +953,11 @@ def ai_chat_page():
             )
 
         full_answer = "\n\n".join(answers)
+
+        # Save to chat history
+        st.session_state.chat_history.append({"role": "user", "text": q})
+        st.session_state.chat_history.append({"role": "assistant", "text": full_answer})
+
         st.markdown("### 💬 Answer")
         st.markdown(full_answer)
 
@@ -952,12 +978,13 @@ def main():
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
 
-    menu = ["Dashboard", "AI Assistant"]
+    # 👉 AI Assistant FIRST
+    menu = ["AI Assistant", "Dashboard"]
     if is_admin():
         menu.append("Admin Panel")
     menu.append("Logout")
 
-    choice = st.sidebar.radio("Go to", menu)
+    choice = st.sidebar.radio("Go to", menu, index=0)
 
     if choice == "Dashboard":
         run_inventory_forecast_app()
