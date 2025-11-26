@@ -898,7 +898,7 @@ def run_inventory_forecast_app():
 
 
 # ======================================================
-#  LOCAL AI CHAT ASSISTANT – NOW DATA-AWARE
+#  LOCAL AI CHAT ASSISTANT – DATA-AWARE + DOWNLOADS
 # ======================================================
 def ai_chat_page():
     """Local, fast AI-style assistant (no external API)."""
@@ -963,8 +963,11 @@ def ai_chat_page():
                 if not df_short.empty:
                     # Sort by Coverage_Days ascending, fallback to On_Hand_Qty
                     if "Coverage_Days" in df_short.columns:
+                        sort_cols = ["Coverage_Days"]
+                        if "On_Hand_Qty" in df_short.columns:
+                            sort_cols.append("On_Hand_Qty")
                         df_short_sorted = df_short.sort_values(
-                            by=["Coverage_Days", "On_Hand_Qty"] if "On_Hand_Qty" in df_short.columns else ["Coverage_Days"],
+                            by=sort_cols,
                             ascending=True,
                             na_position="last",
                         )
@@ -996,6 +999,16 @@ def ai_chat_page():
                     if show_cols:
                         st.markdown("#### 🔴 Top Shortage-Risk Items (Table)")
                         st.dataframe(top_short[show_cols], use_container_width=True)
+
+                        # 🔽 Download button for this exact top-N shortage table
+                        csv_short_top = top_short[show_cols].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "⬇ Download Top Shortage Items (CSV)",
+                            data=csv_short_top,
+                            file_name=f"top_shortage_items_{filename or 'planning'}.csv",
+                            mime="text/csv",
+                            key="dl_ai_shortage",
+                        )
 
                     answers.append(
                         f"- Total Shortage_Risk items: **{df_short.shape[0]:,}**\n"
@@ -1039,6 +1052,16 @@ def ai_chat_page():
                     if show_cols:
                         st.markdown("#### 🟠 Top Excess-Risk Items (Table)")
                         st.dataframe(top_excess[show_cols], use_container_width=True)
+
+                        # 🔽 Download button for this exact top-N excess table
+                        csv_excess_top = top_excess[show_cols].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "⬇ Download Top Excess Items (CSV)",
+                            data=csv_excess_top,
+                            file_name=f"top_excess_items_{filename or 'planning'}.csv",
+                            mime="text/csv",
+                            key="dl_ai_excess",
+                        )
 
                     answers.append(
                         f"- Total Excess_Risk items: **{df_excess.shape[0]:,}**\n"
