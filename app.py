@@ -200,9 +200,8 @@ def init_session_state():
         st.session_state.username = None
     if "role" not in st.session_state:
         st.session_state.role = "viewer"
-    # Chat history for AI Assistant
     if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []  # list of dicts: {"role": "user"/"assistant", "text": "..."}
+        st.session_state.chat_history = []  # {"role": "user"/"assistant", "text": "..."}
 
 
 def is_admin() -> bool:
@@ -224,7 +223,7 @@ def logout():
 
 
 # ======================================================
-#  CACHED DATA FUNCTIONS – SPEED IMPROVEMENT
+#  CACHED DATA FUNCTIONS – SPEED
 # ======================================================
 @st.cache_data(show_spinner=False)
 def load_and_preprocess_excel(file_bytes: bytes) -> pd.DataFrame:
@@ -248,6 +247,15 @@ def load_and_preprocess_excel(file_bytes: bytes) -> pd.DataFrame:
     for col in numeric_cols:
         if col in dfc.columns:
             dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
+    # Also make vendor metrics numeric if present
+    for col in [
+        "Rec_Vendor_LeadTime_Days",
+        "Rec_Vendor_OnTime_Percent",
+        "Rec_Vendor_Reliability_Score",
+        "Rec_Vendor_Composite_Score",
+    ]:
+        if col in dfc.columns:
+            dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
     return dfc
 
 
@@ -261,6 +269,238 @@ def get_latest_df_from_db():
     filename, file_bytes, uploaded_at = latest
     df = load_and_preprocess_excel(file_bytes)
     return df, filename, uploaded_at
+
+
+# ======================================================
+#  JUSTIFICATION HELPERS (DATA-DRIVEN)
+# ======================================================
+def _safe_val(v):
+    return None if pd.isna(v) else v
+
+
+def explain_shortage_row(row_dict: dict) -> str:
+    """Build justification string for a shortage-risk item."""
+    name = row_dict.get("Item Name", "N/A")
+    desc = row_dict.get("Item Description", "")
+    on_hand = _safe_val(row_dict.get("On_Hand_Qty"))
+    min_stock = _safe_val(row_dict.get("Min_Stock"))
+    max_stock = _safe_val(row_dict.get("Max_Stock"))
+    cov = _safe_val(row_dict.get("Coverage_Days"))
+    f3 = _safe_val(row_dict.get("forecast_3M"))
+    f6 = _safe_val(row_dict.get("forecast_6M"))
+    f12 = _safe_val(row_dict.get("forecast_12M"))
+    vendor = row_dict.get("Rec_Vendor_Name", None)
+    v_lead = _safe_val(row_dict.get("Rec_Vendor_LeadTime_Days"))
+    v_ontime = _safe_val(row_dict.get("Rec_Vendor_OnTime_Percent"))
+
+    reasons = []
+
+    # Coverage
+    if cov is not None:
+        try:
+            if cov <= 0:
+                reasons.append(f"coverage is **{cov:.1f} days** (possible stockout)")
+            elif cov < 7:
+                reasons.append(f"coverage only **{cov:.1f} days** (extremely low)")
+            elif cov < 15:
+                reasons.append(f"coverage **{cov:.1f} days** (very low)")
+            elif cov < 30:
+                reasons.append(f"coverage **{cov:.1f} days** (low)")
+            else:
+                reasons.append(f"coverage **{cov:.1f} days** (still low vs desired safety)")
+        except Exception:
+            reasons.append("coverage is low / uncertain")
+    else:
+        reasons.append("coverage not available, but flagged as **Shortage_Risk**")
+
+    # Stock vs Min/Max
+    if on_hand is not None and min_stock is not None:
+        try:
+            if on_hand == 0:
+                reasons.append("On_Hand_Qty is **0** (complete stockout)")
+            if on_hand < min_stock:
+                reasons.append(
+                    f"On_Hand_Qty **{on_hand:.0f}** is **below Min_Stock {min_stock:.0f}**"
+                )
+            elif on_hand == min_stock:
+                reasons.append(
+                    f"On_Hand_Qty **{on_hand:.0f}** is exactly at Min_Stock (no buffer)"
+                )
+            else:
+                gap = on_hand - min_stock
+                reasons.append(
+                    f"On_Hand_Qty **{on_hand:.0f}** is only **{gap:.0f}** units above Min_Stock"
+                )
+        except Exception:
+            pass
+
+    # Demand / forecast trend
+    if f3 is not None and f6 is not None and f12 is not None:
+        try:
+            if f12 > f6 > f3:
+                reasons.append(
+                    "demand forecast is **increasing** (12M > 6M > 3M) while stock is tight"
+                )
+            elif f12 < f6 < f3:
+                reasons.append(
+                    "demand forecast is **declining**, but current stock is already short"
+                )
+            else:
+                reasons.append("demand forecast is **mixed / unstable**, adding planning risk")
+        except Exception:
+            pass
+
+    # Vendor & lead time
+    if vendor:
+        if v_lead is not None:
+            try:
+                if v_lead > 60:
+                    reasons.append(
+                        f"vendor **{vendor}** has **long lead time ~{v_lead:.0f} days**"
+                    )
+                elif v_lead > 30:
+                    reasons.append(
+                        f"vendor **{vendor}** lead time is **~{v_lead:.0f} days**"
+                    )
+                else:
+                    reasons.append(
+                        f"vendor **{vendor}** has relatively shorter lead time (~{v_lead:.0f} days)"
+                    )
+            except Exception:
+                pass
+        if v_ontime is not None:
+            try:
+                if v_ontime < 70:
+                    reasons.append(
+                        f"on-time delivery only **{v_ontime:.1f}%** (unreliable vendor)"
+                    )
+                elif v_ontime < 85:
+                    reasons.append(
+                        f"on-time delivery **{v_ontime:.1f}%** (moderate reliability)"
+                    )
+                else:
+                    reasons.append(
+                        f"on-time delivery **{v_ontime:.1f}%** (generally reliable)"
+                    )
+            except Exception:
+                pass
+
+    if not reasons:
+        reasons.append("flagged as **Shortage_Risk** based on planning model and low stock.")
+
+    desc_part = f" – {desc}" if desc else ""
+    return f"**{name}**{desc_part}: " + "; ".join(reasons) + "."
+
+
+def explain_excess_row(row_dict: dict) -> str:
+    """Justification for excess / overstock items."""
+    name = row_dict.get("Item Name", "N/A")
+    desc = row_dict.get("Item Description", "")
+    on_hand = _safe_val(row_dict.get("On_Hand_Qty"))
+    min_stock = _safe_val(row_dict.get("Min_Stock"))
+    max_stock = _safe_val(row_dict.get("Max_Stock"))
+    cov = _safe_val(row_dict.get("Coverage_Days"))
+    f3 = _safe_val(row_dict.get("forecast_3M"))
+    f6 = _safe_val(row_dict.get("forecast_6M"))
+    f12 = _safe_val(row_dict.get("forecast_12M"))
+
+    reasons = []
+
+    # Coverage high
+    if cov is not None:
+        try:
+            if cov > 365:
+                reasons.append(f"coverage is **{cov:.1f} days** (> 1 year, extreme overstock)")
+            elif cov > 180:
+                reasons.append(f"coverage **{cov:.1f} days** (very high)")
+            elif cov > 120:
+                reasons.append(f"coverage **{cov:.1f} days** (high)")
+            else:
+                reasons.append(f"coverage **{cov:.1f} days** (tending to overstock)")
+        except Exception:
+            pass
+
+    # On_Hand vs Max_Stock
+    if on_hand is not None and max_stock is not None:
+        try:
+            if on_hand > max_stock:
+                extra = on_hand - max_stock
+                reasons.append(
+                    f"On_Hand_Qty **{on_hand:.0f}** is **{extra:.0f} units above Max_Stock {max_stock:.0f}**"
+                )
+        except Exception:
+            pass
+
+    # Demand trend
+    if f3 is not None and f6 is not None and f12 is not None:
+        try:
+            if f12 < f6 < f3:
+                reasons.append("demand forecast is **declining** (12M < 6M < 3M)")
+            elif f12 <= f6 and f6 <= f3 and all(v == 0 for v in [f3, f6, f12]):
+                reasons.append("forecast is almost **zero**, but stock is still high")
+        except Exception:
+            pass
+
+    if not reasons:
+        reasons.append("flagged as **Excess_Risk** due to high stock or coverage vs demand.")
+
+    desc_part = f" – {desc}" if desc else ""
+    return f"**{name}**{desc_part}: " + "; ".join(reasons) + "."
+
+
+def explain_ok_row(row_dict: dict) -> str:
+    """Justification for healthy (OK) items."""
+    name = row_dict.get("Item Name", "N/A")
+    desc = row_dict.get("Item Description", "")
+    on_hand = _safe_val(row_dict.get("On_Hand_Qty"))
+    min_stock = _safe_val(row_dict.get("Min_Stock"))
+    max_stock = _safe_val(row_dict.get("Max_Stock"))
+    cov = _safe_val(row_dict.get("Coverage_Days"))
+
+    reasons = []
+
+    if cov is not None:
+        if 30 <= cov <= 120:
+            reasons.append(f"coverage **{cov:.1f} days** (within healthy band)")
+        elif 15 <= cov < 30:
+            reasons.append(f"coverage **{cov:.1f} days** (slightly lean but acceptable)")
+        elif 120 < cov <= 180:
+            reasons.append(f"coverage **{cov:.1f} days** (on higher side but still manageable)")
+
+    if on_hand is not None and min_stock is not None and max_stock is not None:
+        try:
+            if min_stock < on_hand < max_stock:
+                reasons.append(
+                    f"On_Hand_Qty **{on_hand:.0f}** is between Min_Stock **{min_stock:.0f}** "
+                    f"and Max_Stock **{max_stock:.0f}**"
+                )
+        except Exception:
+            pass
+
+    if not reasons:
+        reasons.append("classified as **OK** by planning model (no major risk flags).")
+
+    desc_part = f" – {desc}" if desc else ""
+    return f"**{name}**{desc_part}: " + "; ".join(reasons) + "."
+
+
+def explain_no_rop_row(row_dict: dict) -> str:
+    """Justification for No-ROP-Model items (missing policy)."""
+    name = row_dict.get("Item Name", "N/A")
+    desc = row_dict.get("Item Description", "")
+    min_stock = _safe_val(row_dict.get("Min_Stock"))
+    max_stock = _safe_val(row_dict.get("Max_Stock"))
+    f12 = _safe_val(row_dict.get("forecast_12M"))
+
+    reasons = ["reorder policy **(ROP / Min–Max)** not defined or incomplete"]
+
+    if min_stock is None or max_stock is None:
+        reasons.append("Min_Stock / Max_Stock values are missing or zero")
+    if f12 is None:
+        reasons.append("12M forecast is missing, planner cannot size inventory correctly")
+
+    desc_part = f" – {desc}" if desc else ""
+    return f"**{name}**{desc_part}: " + "; ".join(reasons) + "."
 
 
 # ======================================================
@@ -812,7 +1052,7 @@ def run_inventory_forecast_app():
             recommendation_lines.append(
                 "✅ **Action:** Slow down or pause new orders, and review consumption plan."
             )
-        elif status.lower() == "ok":
+        elif status.lower() == "OK".lower():
             recommendation_lines.append(
                 "✅ **Action:** No urgent action; continue monitoring based on coverage and forecast."
             )
@@ -898,13 +1138,13 @@ def run_inventory_forecast_app():
 
 
 # ======================================================
-#  LOCAL AI CHAT ASSISTANT – DATA-AWARE + DOWNLOADS
+#  LOCAL AI CHAT ASSISTANT – FULL DATA JUSTIFICATION
 # ======================================================
 def ai_chat_page():
-    """Local, fast AI-style assistant (no external API)."""
+    """Local, fast AI-style assistant (no external API), with data-driven justification."""
     require_login()
 
-    st.header("🤖 AI Assistant (Local, Rule-Based + Data Aware)")
+    st.header("🤖 AI Assistant (Local, Data-Aware)")
 
     df, filename, uploaded_at = get_latest_df_from_db()
 
@@ -923,10 +1163,12 @@ def ai_chat_page():
         "Ask any question related to inventory, Min–Max, stockouts, coverage, "
         "vendor performance, or planning logic.\n\n"
         "Examples:\n"
-        "- *Top 10 shortage-risk items*\n"
+        "- *Top 10 Shortage_Risk items*\n"
         "- *Top 20 excess items by coverage*\n"
-        "- *How to set Min and Max levels?*\n"
-        "This assistant uses rule-based logic and, when available, your latest planning data."
+        "- *Explain shortage for item 10-01-01-005*\n"
+        "- *Vendor Nalco performance*\n"
+        "- *Overall stock summary*\n"
+        "The assistant gives **tables + data-driven justification** wherever possible."
     )
 
     # Show chat history
@@ -949,19 +1191,144 @@ def ai_chat_page():
 
         q_low = q.lower()
         answers = []
-
-        # ------------- DATA-AWARE INTENTS (if df available) -------------
         data_used = False
-        if df is not None and "Stock_Status" in df.columns:
-            # Extract N from question if present (e.g. "top 15 shortage", default 10)
-            nums = re.findall(r"\d+", q_low)
-            n = int(nums[0]) if nums else 10
 
-            # Top shortage items
-            if "shortage" in q_low or "stockout" in q_low or "stock out" in q_low:
+        # Try to extract N (top N)
+        nums = re.findall(r"\d+", q_low)
+        n = int(nums[0]) if nums else 10
+
+        # Helper: check we have a dataframe with required basic columns
+        has_stock_status = df is not None and "Stock_Status" in (df.columns if df is not None else [])
+
+        # ==================================================
+        # 1. ITEM-SPECIFIC QUESTIONS
+        # ==================================================
+        if df is not None and "Item Name" in df.columns:
+            # Try to extract "item CODE"
+            item_match = re.search(r"(item|material)\s+([0-9A-Za-z\-\_/\.]+)", q_low)
+            item_code = None
+            if item_match:
+                item_code = item_match.group(2)
+
+            # Also allow direct exact item name if user types exactly the Item Name
+            if not item_code and any(ch.isdigit() for ch in q_low) and "-" in q_low:
+                # crude fallback: take first token with digits and dash
+                tokens = q_low.split()
+                for t in tokens:
+                    if any(c.isdigit() for c in t) and "-" in t:
+                        item_code = t.strip(".,;:()")
+                        break
+
+            if item_code:
+                # Case-insensitive match in Item Name
+                mask = df["Item Name"].astype(str).str.lower().str.contains(item_code)
+                df_item = df[mask]
+                if not df_item.empty:
+                    row = df_item.iloc[0]
+                    row_dict = row.to_dict()
+                    status = str(row_dict.get("Stock_Status", "")).lower()
+
+                    st.markdown(f"#### 📦 Details for item `{row_dict.get('Item Name', item_code)}`")
+                    st.dataframe(df_item.head(5), use_container_width=True)
+
+                    csv_item = df_item.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇ Download this item’s rows (CSV)",
+                        data=csv_item,
+                        file_name=f"item_{item_code}_{filename or 'planning'}.csv",
+                        mime="text/csv",
+                        key="dl_ai_item",
+                    )
+
+                    # Choose justification based on status
+                    if "shortage" in status:
+                        explanation = explain_shortage_row(row_dict)
+                    elif "excess" in status:
+                        explanation = explain_excess_row(row_dict)
+                    elif status == "ok":
+                        explanation = explain_ok_row(row_dict)
+                    elif "no-rop" in status:
+                        explanation = explain_no_rop_row(row_dict)
+                    else:
+                        explanation = (
+                            f"**{row_dict.get('Item Name', item_code)}**: "
+                            "status is not clearly mapped, but you can review coverage, Min/Max and forecast."
+                        )
+
+                    answers.append("### 🧠 Item-Level Justification\n" + explanation)
+                    data_used = True
+
+        # ==================================================
+        # 2. VENDOR-RELATED QUESTIONS
+        # ==================================================
+        if (
+            df is not None
+            and "Rec_Vendor_Name" in df.columns
+            and "vendor" in q_low
+        ):
+            # Extract vendor query text after the word 'vendor'
+            vendor_part = q_low.split("vendor", 1)[1].strip(" :-")
+            # Remove common words
+            for w in ["performance", "history", "analysis", "summary", "for", "of", "the"]:
+                vendor_part = vendor_part.replace(w, "")
+            vendor_part = vendor_part.strip()
+            vendor_query = vendor_part
+            if vendor_query:
+                mask_vendor = df["Rec_Vendor_Name"].astype(str).str.lower().str.contains(vendor_query)
+                df_v = df[mask_vendor]
+                if not df_v.empty:
+                    data_used = True
+                    st.markdown(f"#### 🧑‍💼 Items linked to vendor containing: `{vendor_query}`")
+                    show_cols = [
+                        "Item Name",
+                        "Item Description",
+                        "Stock_Status",
+                        "On_Hand_Qty",
+                        "Min_Stock",
+                        "Max_Stock",
+                        "Coverage_Days",
+                        "Rec_Vendor_Name",
+                        "Rec_Vendor_LeadTime_Days",
+                        "Rec_Vendor_OnTime_Percent",
+                    ]
+                    show_cols = [c for c in show_cols if c in df_v.columns]
+                    st.dataframe(df_v[show_cols].head(50), use_container_width=True)
+
+                    csv_v = df_v[show_cols].to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇ Download vendor-related items (CSV)",
+                        data=csv_v,
+                        file_name=f"vendor_{vendor_query}_{filename or 'planning'}.csv",
+                        mime="text/csv",
+                        key="dl_ai_vendor",
+                    )
+
+                    # Vendor metrics
+                    lead_mean = df_v["Rec_Vendor_LeadTime_Days"].mean() if "Rec_Vendor_LeadTime_Days" in df_v.columns else None
+                    ontime_mean = df_v["Rec_Vendor_OnTime_Percent"].mean() if "Rec_Vendor_OnTime_Percent" in df_v.columns else None
+                    status_counts_v = df_v["Stock_Status"].value_counts() if "Stock_Status" in df_v.columns else pd.Series()
+
+                    line = "### 🧠 Vendor Performance Summary\n"
+                    line += f"- Matched items: **{df_v.shape[0]:,}**\n"
+                    if lead_mean is not None and not pd.isna(lead_mean):
+                        line += f"- Avg lead time: **{lead_mean:.1f} days**\n"
+                    if ontime_mean is not None and not pd.isna(ontime_mean):
+                        line += f"- Avg on-time delivery: **{ontime_mean:.1f}%**\n"
+                    if not status_counts_v.empty:
+                        for s, c in status_counts_v.items():
+                            line += f"- Items in status **{s}**: **{c:,}**\n"
+
+                    answers.append(line)
+
+        # ==================================================
+        # 3. TOP SHORTAGE / EXCESS / OK / NO-ROP QUESTIONS
+        # ==================================================
+        if has_stock_status:
+            # ----- Top Shortage -----
+            if ("shortage" in q_low or "stockout" in q_low or "stock out" in q_low):
                 df_short = df[df["Stock_Status"] == "Shortage_Risk"].copy()
                 if not df_short.empty:
-                    # Sort by Coverage_Days ascending, fallback to On_Hand_Qty
+                    # Severity: lowest coverage then lowest stock
                     if "Coverage_Days" in df_short.columns:
                         sort_cols = ["Coverage_Days"]
                         if "On_Hand_Qty" in df_short.columns:
@@ -980,7 +1347,8 @@ def ai_chat_page():
 
                     answers.append(
                         f"### 📉 Top {min(n, len(df_short_sorted))} Shortage-Risk Items\n"
-                        "Prioritised by **lowest coverage / stock**.\n"
+                        "Prioritised by **lowest coverage / stock**. "
+                        "Below is the table and justification for each item."
                     )
 
                     show_cols = [
@@ -991,8 +1359,12 @@ def ai_chat_page():
                         "Max_Stock",
                         "Coverage_Days",
                         "Stock_Status",
+                        "forecast_3M",
+                        "forecast_6M",
+                        "forecast_12M",
                         "Rec_Vendor_Name",
                         "Rec_Vendor_LeadTime_Days",
+                        "Rec_Vendor_OnTime_Percent",
                     ]
                     show_cols = [c for c in show_cols if c in top_short.columns]
 
@@ -1000,7 +1372,6 @@ def ai_chat_page():
                         st.markdown("#### 🔴 Top Shortage-Risk Items (Table)")
                         st.dataframe(top_short[show_cols], use_container_width=True)
 
-                        # 🔽 Download button for this exact top-N shortage table
                         csv_short_top = top_short[show_cols].to_csv(index=False).encode("utf-8")
                         st.download_button(
                             "⬇ Download Top Shortage Items (CSV)",
@@ -1010,14 +1381,23 @@ def ai_chat_page():
                             key="dl_ai_shortage",
                         )
 
+                    # Justifications
+                    just_lines = []
+                    for idx, row in enumerate(top_short.to_dict(orient="records"), start=1):
+                        just_lines.append(f"{idx}. " + explain_shortage_row(row))
+                    if just_lines:
+                        st.markdown("#### 🧠 Justification for each shortage item")
+                        for line in just_lines:
+                            st.markdown(line)
+
                     answers.append(
                         f"- Total Shortage_Risk items: **{df_short.shape[0]:,}**\n"
                         f"- Showing **top {min(n, df_short.shape[0])}** items with lowest coverage / stock.\n"
-                        "- Recommended: place POs on these first, considering vendor lead time and criticality."
+                        "- Justification considers **coverage, Min/Max, forecast trend, and vendor risk**."
                     )
                     data_used = True
 
-            # Top excess / overstock items
+            # ----- Top Excess / Overstock -----
             if "excess" in q_low or "overstock" in q_low or "slow moving" in q_low:
                 df_excess = df[df["Stock_Status"] == "Excess_Risk"].copy()
                 if not df_excess.empty:
@@ -1034,7 +1414,7 @@ def ai_chat_page():
 
                     answers.append(
                         f"### 📦 Top {min(n, len(df_excess_sorted))} Excess / Overstock Items\n"
-                        "Prioritised by **highest coverage / stock**.\n"
+                        "Prioritised by **highest coverage / stock**."
                     )
 
                     show_cols = [
@@ -1053,7 +1433,6 @@ def ai_chat_page():
                         st.markdown("#### 🟠 Top Excess-Risk Items (Table)")
                         st.dataframe(top_excess[show_cols], use_container_width=True)
 
-                        # 🔽 Download button for this exact top-N excess table
                         csv_excess_top = top_excess[show_cols].to_csv(index=False).encode("utf-8")
                         st.download_button(
                             "⬇ Download Top Excess Items (CSV)",
@@ -1063,15 +1442,114 @@ def ai_chat_page():
                             key="dl_ai_excess",
                         )
 
+                    # Justifications for excess
+                    just_lines = []
+                    for idx, row in enumerate(top_excess.to_dict(orient="records"), start=1):
+                        just_lines.append(f"{idx}. " + explain_excess_row(row))
+                    if just_lines:
+                        st.markdown("#### 🧠 Justification for each excess item")
+                        for line in just_lines:
+                            st.markdown(line)
+
                     answers.append(
                         f"- Total Excess_Risk items: **{df_excess.shape[0]:,}**\n"
                         f"- Showing **top {min(n, df_excess.shape[0])}** items with highest coverage / stock.\n"
-                        "- Recommended: put these on PO hold, review demand, and explore substitution or liquidation."
+                        "- Recommended: put on PO hold, review demand, and explore substitution or liquidation."
                     )
                     data_used = True
 
-            # Overall summary
-            if ("summary" in q_low or "overall" in q_low) and not data_used:
+            # ----- Top OK / Healthy items -----
+            if ("healthy" in q_low or "ok items" in q_low or "top ok" in q_low) and "OK" in df["Stock_Status"].unique():
+                df_ok = df[df["Stock_Status"] == "OK"].copy()
+                if not df_ok.empty:
+                    df_ok_sorted = df_ok.copy()
+                    if "Coverage_Days" in df_ok_sorted.columns:
+                        df_ok_sorted = df_ok_sorted.sort_values("Coverage_Days", ascending=True)
+
+                    top_ok = df_ok_sorted.head(n)
+                    answers.append(
+                        f"### ✅ Top {min(n, len(df_ok_sorted))} Healthy (OK) Items\n"
+                        "Items with balanced coverage and stock within Min–Max."
+                    )
+
+                    show_cols = [
+                        "Item Name",
+                        "Item Description",
+                        "On_Hand_Qty",
+                        "Min_Stock",
+                        "Max_Stock",
+                        "Coverage_Days",
+                        "Stock_Status",
+                    ]
+                    show_cols = [c for c in show_cols if c in top_ok.columns]
+
+                    if show_cols:
+                        st.markdown("#### ✅ Healthy Items (Table)")
+                        st.dataframe(top_ok[show_cols], use_container_width=True)
+
+                        csv_ok_top = top_ok[show_cols].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "⬇ Download Top OK Items (CSV)",
+                            data=csv_ok_top,
+                            file_name=f"top_ok_items_{filename or 'planning'}.csv",
+                            mime="text/csv",
+                            key="dl_ai_ok",
+                        )
+
+                    just_lines = []
+                    for idx, row in enumerate(top_ok.to_dict(orient="records"), start=1):
+                        just_lines.append(f"{idx}. " + explain_ok_row(row))
+                    if just_lines:
+                        st.markdown("#### 🧠 Justification for each OK item")
+                        for line in just_lines:
+                            st.markdown(line)
+                    data_used = True
+
+            # ----- Top No-ROP-Model items -----
+            if "no-rop" in q_low or "no rop" in q_low:
+                df_nr = df[df["Stock_Status"] == "No-ROP-Model"].copy()
+                if not df_nr.empty:
+                    df_nr_sorted = df_nr.head(n)
+                    answers.append(
+                        f"### ℹ Top {min(n, len(df_nr))} No-ROP-Model Items\n"
+                        "Items without a defined reorder policy ( Min–Max / ROP missing )."
+                    )
+
+                    show_cols = [
+                        "Item Name",
+                        "Item Description",
+                        "On_Hand_Qty",
+                        "Min_Stock",
+                        "Max_Stock",
+                        "Coverage_Days",
+                        "Stock_Status",
+                    ]
+                    show_cols = [c for c in show_cols if c in df_nr_sorted.columns]
+
+                    if show_cols:
+                        st.markdown("#### ℹ No-ROP-Model Items (Table)")
+                        st.dataframe(df_nr_sorted[show_cols], use_container_width=True)
+
+                        csv_nr_top = df_nr_sorted[show_cols].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "⬇ Download Top No-ROP-Model Items (CSV)",
+                            data=csv_nr_top,
+                            file_name=f"top_no_rop_items_{filename or 'planning'}.csv",
+                            mime="text/csv",
+                            key="dl_ai_norop",
+                        )
+
+                    just_lines = []
+                    for idx, row in enumerate(df_nr_sorted.to_dict(orient="records"), start=1):
+                        just_lines.append(f"{idx}. " + explain_no_rop_row(row))
+                    if just_lines:
+                        st.markdown("#### 🧠 Justification for each No-ROP item")
+                        for line in just_lines:
+                            st.markdown(line)
+                    data_used = True
+
+            # ----- Overall summary -----
+            if ("summary" in q_low or "overall" in q_low or "health" in q_low) and not data_used:
                 status_counts = df["Stock_Status"].value_counts()
                 total = df.shape[0]
                 shortage = int(status_counts.get("Shortage_Risk", 0))
@@ -1086,62 +1564,56 @@ def ai_chat_page():
                     f"- Excess_Risk: **{excess:,}**\n"
                     f"- OK: **{healthy:,}**\n"
                     f"- No-ROP-Model: **{no_rop:,}**\n"
+                    "Focus first on **Shortage_Risk** items with very low coverage, then on **Excess_Risk** with very high coverage."
                 )
                 data_used = True
 
-        # ------------- RULE-BASED GUIDANCE (as earlier) -------------
-        # Stockout / shortage
-        if "stockout" in q_low or "stock out" in q_low or "shortage" in q_low:
-            answers.append(
-                "### 🔴 Handling Stockouts / Shortage Risk\n"
-                "- Identify SKUs with `Stock_Status = Shortage_Risk` and very low `Coverage_Days` (e.g. < 15 days).\n"
-                "- Check `On_Hand_Qty` vs `Min_Stock`. If On Hand < Min Stock, plan an urgent PO.\n"
-                "- Use recommended vendor fields and lead time to pick fastest reliable vendor.\n"
-                "- For long lead-time items, consider safety stock increase and alternate vendors.\n"
-                "- Communicate risk items to production so they can adjust schedules."
-            )
-
-        # Excess / overstock
-        if "overstock" in q_low or "excess" in q_low or "slow moving" in q_low:
-            answers.append(
-                "### 🟠 Handling Excess / Overstock\n"
-                "- Filter items with `Stock_Status = Excess_Risk` and very high `Coverage_Days` (e.g. > 180 days).\n"
-                "- Compare `On_Hand_Qty` vs `Max_Stock`. If On Hand >> Max Stock, put the item on PO hold.\n"
-                "- Reduce or postpone new orders for these items.\n"
-                "- Discuss alternate uses or substitution possibilities with users.\n"
-                "- Plan liquidation or scrap review for extreme cases."
-            )
-
+        # ==================================================
+        # 4. CONCEPTUAL / RULE-BASED ANSWERS (NO DATA OR EXTRA)
+        # ==================================================
         # Min/Max
         if "min" in q_low and "max" in q_low:
             answers.append(
-                "### 📏 Setting Min / Max Levels\n"
-                "- Estimate monthly demand from `forecast_12M` (or 6M/3M).\n"
-                "- Reorder point (ROP) ≈ Demand during lead time + safety stock.\n"
-                "- Demand during lead time ≈ Monthly demand × (LeadTimeDays / 30).\n"
-                "- Safety stock can be based on variability or existing Min_Stock.\n"
-                "- Set Max_Stock around 1.5–2 × ROP for critical items, lower for others.\n"
-                "- Review parameters regularly for items with unstable demand."
+                "### 📏 Setting Min / Max Levels – Justification\n"
+                "- **Objective:** balance stockout risk vs inventory carrying cost.\n"
+                "- **Step 1 – Demand:** use `forecast_12M` (or 6M/3M) to estimate monthly demand.\n"
+                "- **Step 2 – Lead time demand:** Demand during lead time ≈ Monthly demand × (LeadTimeDays / 30).\n"
+                "- **Step 3 – Safety stock:** based on variability of demand and lead time; can start with 0.5–1 month demand for non-critical, higher for critical.\n"
+                "- **Step 4 – ROP:** Reorder point ≈ Lead time demand + safety stock.\n"
+                "- **Step 5 – Max_Stock:** usually 1.5–2 × ROP for critical items; lower factor for high-value items.\n"
+                "Justification is always based on **demand variability, lead time reliability, and criticality of the item.**"
             )
 
-        # Vendor
-        if "vendor" in q_low or "supplier" in q_low:
+        # Stockouts / shortage concept
+        if "stockout" in q_low or "stock out" in q_low or "shortage" in q_low:
             answers.append(
-                "### 🧑‍💼 Vendor Performance & Selection\n"
-                "- Compare vendors on on-time %, reliability score, and composite score.\n"
-                "- For critical items, prefer vendors with high on-time and reliability even if slightly costlier.\n"
-                "- Use poor performers only for non-critical items or as backup.\n"
-                "- Track lead time adherence and update master data when vendor performance changes."
+                "### 🔴 Handling Stockouts / Shortage Risk – Justification\n"
+                "- Start with items having `Stock_Status = Shortage_Risk` and coverage < 15 days.\n"
+                "- If On_Hand_Qty < Min_Stock, there is a clear policy violation or demand spike.\n"
+                "- Check if vendor lead time and on-time % are causing repeated delays.\n"
+                "- For long lead-time items, larger safety stock is justified to avoid production stoppage.\n"
+                "- Each urgent PO or emergency purchase is a symptom that Min–Max or forecast needs correction."
             )
 
-        # Coverage
+        # Excess / overstock concept
+        if "excess" in q_low or "overstock" in q_low or "slow moving" in q_low:
+            answers.append(
+                "### 🟠 Handling Excess / Overstock – Justification\n"
+                "- Items with coverage > 180–365 days tie up working capital unnecessarily.\n"
+                "- If On_Hand_Qty >> Max_Stock, procurement or forecast has overshot real demand.\n"
+                "- Declining forecast with high stock strongly justifies reducing or stopping new POs.\n"
+                "- Options: internal transfer, substitution, project reassignment, or controlled liquidation."
+            )
+
+        # Coverage concept
         if "coverage" in q_low:
             answers.append(
-                "### ⏱ Coverage Days Interpretation\n"
-                "- < 15 days: Very high stockout risk → expedite PO.\n"
-                "- 15–45 days: Acceptable but monitor.\n"
-                "- 45–120 days: Healthy coverage.\n"
-                "- > 120 days: Potential overstock → slow or stop new orders and review forecast."
+                "### ⏱ Coverage Days Interpretation – Justification\n"
+                "- **< 15 days:** High risk of stockout – urgent action justified.\n"
+                "- **15–45 days:** Lean but workable – acceptable for fast-moving items.\n"
+                "- **45–120 days:** Good comfort zone for most operational spares.\n"
+                "- **> 120 days:** Over-protection, especially for high-value items; review demand and Min/Max.\n"
+                "Coverage is justified as a simple way to express inventory in the language of time."
             )
 
         # Reorder / PO
@@ -1152,29 +1624,28 @@ def ai_chat_page():
             or "po " in q_low
         ):
             answers.append(
-                "### 📦 Reorder Quantity & PO Recommendation\n"
-                "- Monthly demand from forecast; ROP = demand during lead time + safety stock.\n"
-                "- Target stock = Max_Stock or ~1.5 × ROP.\n"
-                "- Suggested order = max(0, TargetStock − OnHand).\n"
-                "- For high-value items, reduce target and order more frequently in smaller lots."
+                "### 📦 Reorder Quantity & PO Recommendation – Justification\n"
+                "- Reorder point is justified by ensuring you have enough stock to cover **lead time demand** plus **uncertainty**.\n"
+                "- Target stock is justified by balancing order frequency vs carrying cost.\n"
+                "- For high-value items, it is justified to keep lower Max_Stock and order more frequently.\n"
+                "- For critical items with long lead time, higher ROP and Max_Stock are justified to avoid shutdowns."
             )
 
-        # Fallback
+        # Fallback if nothing matched
         if not answers:
             if df is None:
                 answers.append(
                     "### 🧠 General Guidance (No Data Loaded)\n"
                     "- Upload a planning file from the Dashboard to enable data-based insights.\n"
-                    "- Once loaded, you can ask questions like *'Top 10 shortage-risk items'* or *'Overall summary'*.\n"
-                    "- Conceptually, focus first on Shortage_Risk items with low coverage, then on Excess_Risk with very high coverage."
+                    "- Once loaded, you can ask questions like *'Top 10 Shortage_Risk items'* or *'Explain shortage for item 10-01-01-005'*.\n"
+                    "- Conceptually, always justify your decisions based on **coverage, Min/Max, forecast, and vendor performance.**"
                 )
             else:
                 answers.append(
                     "### 🧠 General Guidance\n"
-                    "- Focus first on Shortage_Risk items with low coverage; then on Excess_Risk with very high coverage.\n"
-                    "- Use the Dashboard → Item Insights section to analyse a specific SKU.\n"
-                    "- If you share concrete numbers (On_Hand, Min, Max, forecast, lead time), "
-                    "you can translate them into ROP and recommended order using the same logic used in the app."
+                    "- Focus first on **Shortage_Risk** items with low coverage, then **Excess_Risk** with very high coverage.\n"
+                    "- You can also ask specifically about items or vendors (e.g., *'Explain shortage for item 10-01-01-005'* or *'Vendor Nalco performance'*).\n"
+                    "- All justifications should be grounded in the data: coverage, Min/Max, forecast, and vendor KPIs."
                 )
 
         full_answer = "\n\n".join(answers)
@@ -1203,7 +1674,7 @@ def main():
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
     st.sidebar.write(f"🔑 Role: **{st.session_state.role}**")
 
-    # 👉 AI Assistant FIRST
+    # AI Assistant first (since that’s your main playground)
     menu = ["AI Assistant", "Dashboard"]
     if is_admin():
         menu.append("Admin Panel")
